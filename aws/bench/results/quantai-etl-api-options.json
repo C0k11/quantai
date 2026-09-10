@@ -1,0 +1,43 @@
+{
+  "function": "quantai-etl-api",
+  "route": "options",
+  "region": "ca-central-1",
+  "measured_at": "2026-09-10T17:12:47+00:00",
+  "sweep": [
+    {
+      "memory_mb": 1024,
+      "statuses": [
+        200
+      ],
+      "cold_init_ms": {
+        "n": 20,
+        "min": 478.05,
+        "median": 636.15,
+        "max": 898.71,
+        "p95": 755.02
+      },
+      "cold_duration_ms": {
+        "n": 20,
+        "min": 1933.44,
+        "median": 2043.7,
+        "max": 2238.22,
+        "p95": 2180.11
+      },
+      "warm_duration_ms": {
+        "n": 30,
+        "min": 1.61,
+        "median": 1.79,
+        "max": 6.46,
+        "p95": 2.72
+      },
+      "warm_billed_ms": {
+        "n": 30,
+        "min": 2.0,
+        "median": 2.0,
+        "max": 7.0,
+        "p95": 3.0
+      },
+      "max_used_mb": 250
+    }
+  ]
+}
