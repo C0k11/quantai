@@ -21,6 +21,13 @@ Parameters:
     Type: Number
     Default: 1769
     Description: 1769 MB is one full vCPU; Phase 6 sweeps this for the cost knee.
+  ApiKeyParameter:
+    Type: String
+    Default: /quantai/api-key
+    Description: >
+      SSM SecureString holding the shared secret. Only the NAME lives in this
+      template - the value is set out of band, so no secret ever enters the
+      template, the changeset, or CloudFormation state.
 
 Resources:
 
@@ -88,6 +95,90 @@ Resources:
       Dockerfile: aws/etl/Dockerfile
       DockerTag: latest
 
+  # --------------------------------------------------------------- 计算 API
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: v1
+      # 限流是钱包的保险丝，与鉴权互相独立：即使 key 泄露也烧不动账单。
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 5
+        ThrottlingBurstLimit: 10
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-api
+      RetentionInDays: 14
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: api-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # API 只读行情，连写权限都不给（和 ETL 角色是两个角色，权限不共用）。
+              - Sid: ReadExportsOnly
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${DataBucket}/exports/*
+              - Sid: ReadOwnApiKeyOnly
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ApiKeyParameter}
+              - Sid: DecryptViaSsmOnly
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: '*'
+                # kms:Decrypt 无法按资源收紧到默认托管密钥，改用条件把它锁死在 SSM 通道上。
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+              - Sid: WriteOwnLogStreamOnly
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub ${ApiLogGroup.Arn}:*
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ApiLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-api
+      PackageType: Image
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 15
+      MemorySize: 1024
+      Environment:
+        Variables:
+          QUANTAI_S3_BUCKET: !Ref DataBucket
+          QUANTAI_API_KEY_PARAM: !Ref ApiKeyParameter
+      Events:
+        OptionsPrice:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /options/price
+        Signals:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /signals
+    Metadata:
+      DockerContext: ..
+      Dockerfile: aws/api/Dockerfile
+      DockerTag: latest
+
 Outputs:
   FunctionName:
     Value: !Ref EtlFunction
@@ -95,3 +186,7 @@ Outputs:
     Value: !Ref EtlLogGroup
   RoleArn:
     Value: !GetAtt EtlRole.Arn
+  ApiEndpoint:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1
+  ApiFunctionName:
+    Value: !Ref ApiFunction

@@ -1,0 +1,8 @@
+# API 只要数值计算，不要 dbt/yfinance/pyarrow —— 镜像比 ETL 那个小得多，冷启动更快。
+numpy>=1.24.0
+pandas>=2.0.0,<3
+scipy>=1.11.0
+pydantic>=2.5.0
+pyyaml>=6.0.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
