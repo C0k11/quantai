@@ -26,7 +26,12 @@ Description: >
 Parameters:
   GitHubRepo:
     Type: String
-    Default: C0k11/quantai
+    # GitHub 给这个仓库签发的 sub 带不可变数字 ID：repo:<owner>@<owner_id>/<repo>@<repo_id>:...
+    # （CloudTrail 里失败的 AssumeRoleWithWebIdentity 与 GitHub API 的 sub_claim_prefix 双重实测，
+    # 且 use_default=true，是平台默认而非仓库定制）。按 ID 匹配：仓库改名不影响信任，
+    # 删库后被人抢注同名仓库也冒充不了——这个仓库正好刚从 stock-share-Helper 改名过来。
+    # ID 是 GitHub 公开元数据，不是 AWS 账号信息。
+    Default: C0k11@156249989/quantai@1116026972
   Branch:
     Type: String
     Default: main
