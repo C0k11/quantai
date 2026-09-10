@@ -21,6 +21,10 @@ Parameters:
     Type: Number
     Default: 1769
     Description: 1769 MB is one full vCPU; Phase 6 sweeps this for the cost knee.
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Where alarms go. Empty means no subscription is created.
   ApiKeyParameter:
     Type: String
     Default: /quantai/api-key
@@ -28,6 +32,9 @@ Parameters:
       SSM SecureString holding the shared secret. Only the NAME lives in this
       template - the value is set out of band, so no secret ever enters the
       template, the changeset, or CloudFormation state.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
 
 Resources:
 
@@ -94,6 +101,61 @@ Resources:
       DockerContext: ..
       Dockerfile: aws/etl/Dockerfile
       DockerTag: latest
+
+  # --------------------------------------------------------------- 告警
+  # 本地版本的失败模式是：warehouse 挂了、report 正常退出，Task Scheduler 的
+  # Last Result 把整体伪装成成功，没人看日志就永远发现不了。这两个告警就是替掉它。
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: QuantAI alarms
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+      TopicArn: !Ref AlarmTopic
+
+  EtlFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-etl-failed
+      AlarmDescription: Nightly ETL raised an unhandled error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref EtlFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # 每天只跑一次，绝大多数周期本来就没数据 —— 缺数据不是故障。
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  NewsFeedFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-news-feeds-degraded
+      AlarmDescription: >
+        RSS feeds failed during the run. The ETL degrades gracefully and still
+        exits 0, so without this metric the warehouse silently loses news rows.
+      # 由 handler 用 Embedded Metric Format 从日志里发出，没有 PutMetricData 调用。
+      Namespace: QuantAI/ETL
+      MetricName: NewsFeedFailures
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref EtlFunction }
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
 
   # --------------------------------------------------------------- 计算 API
 

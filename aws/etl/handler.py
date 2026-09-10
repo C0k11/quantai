@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -22,6 +23,9 @@ import time
 from pathlib import Path
 
 import boto3
+
+# 同一个执行环境会被复用；模块级只在冷启动执行一次，据此区分冷/热。
+_COLD_START = True
 
 TASK_ROOT = Path(os.environ.get("LAMBDA_TASK_ROOT", Path(__file__).parent))
 sys.path.insert(0, str(TASK_ROOT))
@@ -38,6 +42,57 @@ WATCHLIST = TMP / "watchlist.yaml"
 DB_KEY = "warehouse/quantai.duckdb"
 
 _s3 = boto3.client("s3")
+
+
+class _FeedFailureCounter:
+    """数 news 模块报了多少条 ERROR。
+
+    Phase 0 实测：Yahoo RSS 会间歇 400/502，代码优雅降级继续跑——本地能看到红字，
+    云上定时任务却会**静默少数据**。所以把它变成一个可告警的指标，而不是日志里的一行。
+    不改 quantai.data.news：挂一个 loguru sink 就够了。
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+        self._sink_id: int | None = None
+
+    def __enter__(self) -> "_FeedFailureCounter":
+        from loguru import logger
+
+        def _sink(message) -> None:  # noqa: ANN001 - loguru record
+            rec = message.record
+            if rec["level"].name == "ERROR" and "news" in rec["name"]:
+                self.count += 1
+
+        self._sink_id = logger.add(_sink, level="ERROR")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        from loguru import logger
+
+        if self._sink_id is not None:
+            logger.remove(self._sink_id)
+
+
+def _emit_metrics(function_name: str, metrics: dict[str, tuple[float, str]]) -> None:
+    """CloudWatch Embedded Metric Format：指标嵌在本来就要写的日志行里。
+
+    这样请求路径上**没有额外的 PutMetricData 调用**（零延迟开销），执行角色也
+    **不需要 cloudwatch:PutMetricData 权限**——CloudWatch 从日志里自己抽。
+    """
+    payload = {
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [{
+                "Namespace": "QuantAI/ETL",
+                "Dimensions": [["FunctionName"]],
+                "Metrics": [{"Name": k, "Unit": u} for k, (_, u) in metrics.items()],
+            }],
+        },
+        "FunctionName": function_name,
+        **{k: v for k, (v, _) in metrics.items()},
+    }
+    print(json.dumps(payload))
 
 
 def _bucket() -> str:
@@ -81,6 +136,10 @@ def _cleanup() -> None:
 
 
 def handler(event, context):  # noqa: ANN001 - Lambda 签名
+    global _COLD_START
+    cold = _COLD_START
+    _COLD_START = False
+
     t0 = time.perf_counter()
     bucket = _bucket()
     prefix = os.environ.get("QUANTAI_S3_PREFIX", "exports")
@@ -91,7 +150,8 @@ def handler(event, context):  # noqa: ANN001 - Lambda 签名
     import s3_publish
     import warehouse as warehouse_cli
 
-    rc = warehouse_cli.main(["--full", "--no-positions", "--db", str(DB_PATH)])
+    with _FeedFailureCounter() as feeds:
+        rc = warehouse_cli.main(["--full", "--no-positions", "--db", str(DB_PATH)])
     if rc != 0:
         raise RuntimeError(f"warehouse --full 失败 rc={rc}")
     etl_sec = time.perf_counter() - t0
@@ -110,14 +170,25 @@ def handler(event, context):  # noqa: ANN001 - Lambda 签名
     _s3.upload_file(str(DB_PATH), bucket, DB_KEY)
 
     total_sec = time.perf_counter() - t0
+    db_mb = round(DB_PATH.stat().st_size / 1_048_576, 1)
     result = {
         "uploaded": uploaded,
         "warm_start": warm,
-        "db_mb": round(DB_PATH.stat().st_size / 1_048_576, 1),
+        "cold_start": cold,
+        "db_mb": db_mb,
+        "news_feed_failures": feeds.count,
         "etl_seconds": round(etl_sec, 2),
         "total_seconds": round(total_sec, 2),
         "positions_loaded": False,
     }
+    _emit_metrics(context.function_name if context else "local", {
+        "EtlDurationMs": (round(etl_sec * 1000), "Milliseconds"),
+        "TotalDurationMs": (round(total_sec * 1000), "Milliseconds"),
+        "ExportedFiles": (uploaded, "Count"),
+        "NewsFeedFailures": (feeds.count, "Count"),
+        "WarehouseMB": (db_mb, "Megabytes"),
+        "ColdStart": (1 if cold else 0, "Count"),
+    })
     print(f"[etl-lambda] {result}")
     _cleanup()
     return result
