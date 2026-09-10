@@ -66,7 +66,14 @@ def _drop_partial_today(prices: dict) -> int:
     return dropped
 
 
-def _load_raw(db_path: Path, portfolio_file: str, years: int, benchmark: str) -> None:
+def _load_raw(db_path: Path, portfolio_file: str, years: int, benchmark: str,
+              with_positions: bool = True) -> None:
+    """装载 raw 层。
+
+    `with_positions=False` 是云侧（Lambda）用的：头寸数字按设计不出本地边界，
+    所以云上既不读 portfolio 文件也不写 raw.positions。标的全集不受影响——
+    自选股清单已覆盖持仓标的，行情/新闻照抓。
+    """
     from quantai.backtest import run_backtest
     from quantai.config import load_config
     from quantai.data.news import NewsFetcher
@@ -82,9 +89,10 @@ def _load_raw(db_path: Path, portfolio_file: str, years: int, benchmark: str) ->
 
     from quantai.data.watchlist import load_watchlist
 
-    portfolio = load_portfolio(portfolio_file)
+    portfolio = load_portfolio(portfolio_file) if with_positions else None
     watchlist = load_watchlist(load_config().portfolio.watchlist_file)
-    symbols = list(dict.fromkeys(portfolio.symbols + watchlist + [benchmark]))
+    held = portfolio.symbols if portfolio is not None else []
+    symbols = list(dict.fromkeys(held + watchlist + [benchmark]))
     start = (datetime.now() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
     end = datetime.now().strftime("%Y-%m-%d")
 
@@ -101,8 +109,11 @@ def _load_raw(db_path: Path, portfolio_file: str, years: int, benchmark: str) ->
         n = load_trading_days(con, start, end)
         print(f"[etl] raw.trading_days    +{n}")
         as_of = max(str(df.index[-1].date()) for df in prices.values()) if prices else end
-        n = load_positions(con, portfolio, as_of=as_of)
-        print(f"[etl] raw.positions       +{n} (as_of {as_of})")
+        if portfolio is not None:
+            n = load_positions(con, portfolio, as_of=as_of)
+            print(f"[etl] raw.positions       +{n} (as_of {as_of})")
+        else:
+            print("[etl] raw.positions       skipped（头寸不出本地边界）")
         gen = SignalGenerator()
         for sym, df in prices.items():
             load_signals(con, sym, gen.generate(df))
@@ -172,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dbt", action="store_true", help="跑 dbt build（staging+marts+tests）")
     p.add_argument("--export", action="store_true", help="导出 marts -> data/exports/*.csv")
     p.add_argument("--full", action="store_true", help="load + dbt + export 一条龙")
+    p.add_argument("--no-positions", action="store_true",
+                   help="不读持仓文件、不写 raw.positions（云侧 Lambda 用：头寸不出本地边界）")
     args = p.parse_args(argv)
 
     db_path = Path(args.db)
@@ -181,7 +194,8 @@ def main(argv: list[str] | None = None) -> int:
         p.print_help()
         return 1
     if args.load:
-        _load_raw(db_path, args.portfolio, args.years, args.benchmark)
+        _load_raw(db_path, args.portfolio, args.years, args.benchmark,
+                  with_positions=not args.no_positions)
     if args.dbt:
         _run_dbt(db_path)
     if args.export:
