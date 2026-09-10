@@ -168,6 +168,12 @@ Resources:
                 Effect: Allow
                 Action: cloudwatch:DescribeAlarms
                 Resource: '*'
+              - Sid: SamTransformRunsAsServiceRole
+                # 栈指定了服务角色后，CloudFormation 用这个角色的身份展开 SAM transform。
+                # CI #2 实测：缺这条时 changeset 直接 FAILED（exec 角色无权 CreateChangeSet on transform）。
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
 
   GitHubDeployRole:
     Type: AWS::IAM::Role
