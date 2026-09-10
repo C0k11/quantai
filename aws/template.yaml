@@ -225,7 +225,9 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-api
       PackageType: Image
       Role: !GetAtt ApiRole.Arn
-      Timeout: 15
+      # 请求路径上一次 S3/SSM 调用最坏约 9 s（aws/api/handler.py 的客户端超时）；/signals 在新执行环境上
+      # 先读 key 再读行情表，最坏约 18 s。20 s 让这种情况以 503 返回，而不是被超时掐断。
+      Timeout: 20
       MemorySize: 1024
       Environment:
         Variables:

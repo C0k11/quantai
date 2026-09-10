@@ -6,10 +6,14 @@
     POST /signals         对某标的重算组合信号（数据源是 S3 里的公开行情）
 
 鉴权：`x-api-key` 头，与 SSM Parameter Store 的 SecureString 比对。
-**参数没设值就一律拒绝**（fail closed，不是 fail open）。
+**参数没设值就一律拒绝**（fail closed，不是 fail open）；读失败不永久缓存，退避后重试。
 
-冷启动时把 fact_prices 一次性读进内存，请求路径上零 S3 往返——代价是冷启动更慢，
-这个取舍有实测数字（见 README）。
+init 阶段（冷启动）只做 import：scipy、pandas、信号模块在模块顶层导入。新镜像部署后，CI 发几个
+不带 key 的请求（全部 401），每个都会起一个已经把这些依赖加载好的执行环境，部署后首调的代价由 CI
+付，不落到第一个真实请求上，CI 也不需要持有 API key。
+网络读取（API key、行情表）不放在 init：init 有 10 s 上限，一个卡住的 S3/SSM 调用会让整个函数起不来，
+连 401 路径都会失败。它们留在请求路径上，受函数超时约束，客户端超时收短，失败按退避重试：
+key 读不到一律 401；行情表读不到 /signals 返回 503。
 
 环境变量：
     QUANTAI_S3_BUCKET     数据湖桶名
@@ -17,19 +21,37 @@
 """
 from __future__ import annotations
 
-import json
 import hmac
+import json
 import os
+import time
 from io import BytesIO
 from typing import Any
 
 import boto3
+import pandas as pd
+from botocore.config import Config
 
-_s3 = boto3.client("s3")
-_ssm = boto3.client("ssm")
+from quantai.analysis.options import bs_greeks, bs_price
+from quantai.signals.generator import SignalGenerator
 
-_PRICES: Any = None       # 冷启动填充
+# boto3 默认连接、读取超时各 60 s。这里一次 S3/SSM 调用最坏约 2 x (1 + 3) + 1 = 9 s（第一次重试前的退避不超过 1 s）。
+# /signals 在新执行环境上会先读 key 再读行情表，最坏约 18 s；函数超时 20 s（aws/template.yaml），
+# 所以依赖出问题时返回的是 401/503，而不是被超时掐断。
+_AWS_CFG_KWARGS = {"connect_timeout": 1, "read_timeout": 3,
+                   "retries": {"total_max_attempts": 2, "mode": "standard"}}
+_AWS_CFG = Config(**_AWS_CFG_KWARGS)
+_s3 = boto3.client("s3", config=_AWS_CFG)
+_ssm = boto3.client("ssm", config=_AWS_CFG)
+
+KEY_RETRY_SEC = 60.0
+PRICES_RETRY_SEC = 30.0
+_now = time.monotonic          # 单独引用一份，测试里可以换成假时钟
+
 _API_KEY: str | None = None
+_KEY_RETRY_AT = 0.0            # 读 key 失败后，这个时刻之前不再打 SSM
+_PRICES: Any = None
+_PRICES_RETRY_AT = 0.0         # 读行情表失败后，这个时刻之前不再打 S3
 
 
 def _json(status: int, body: dict) -> dict:
@@ -41,15 +63,29 @@ def _json(status: int, body: dict) -> dict:
 
 
 def _load_api_key() -> str:
-    """从 SSM 读期望的 key。取不到就返回空串 -> 所有请求被拒。"""
-    global _API_KEY
-    if _API_KEY is None:
-        name = os.environ.get("QUANTAI_API_KEY_PARAM", "")
-        try:
-            _API_KEY = _ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
-        except Exception as exc:  # 参数不存在/无权限/未设值
-            print(f"[api] API key 不可用，全部拒绝：{type(exc).__name__}")
-            _API_KEY = ""
+    """从 SSM 读期望的 key。取不到就返回空串 -> 所有请求被拒（fail closed）。
+
+    读成功才缓存；读失败不永久缓存，KEY_RETRY_SEC 之后再试。否则 key 建好之前起来的执行环境
+    会一直 401 到被回收；退避期内不再打 SSM，被没 key 的请求刷也只会每分钟试一次。
+    """
+    global _API_KEY, _KEY_RETRY_AT
+    if _API_KEY:
+        return _API_KEY
+    now = _now()
+    if now < _KEY_RETRY_AT:
+        return ""
+    name = os.environ.get("QUANTAI_API_KEY_PARAM", "")
+    try:
+        value = _ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]["Value"]
+    except Exception as exc:  # 参数不存在/无权限/未设值/超时
+        print(f"[api] API key 不可用，全部拒绝，{KEY_RETRY_SEC:.0f} 秒后重试：{type(exc).__name__}")
+        _KEY_RETRY_AT = now + KEY_RETRY_SEC
+        return ""
+    if not value:
+        print(f"[api] API key 为空值，全部拒绝，{KEY_RETRY_SEC:.0f} 秒后重试")
+        _KEY_RETRY_AT = now + KEY_RETRY_SEC
+        return ""
+    _API_KEY = value
     return _API_KEY
 
 
@@ -57,32 +93,41 @@ def _authorised(event: dict) -> bool:
     expected = _load_api_key()
     if not expected:
         return False
-    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
-    return hmac.compare_digest(headers.get("x-api-key", ""), expected)
+    headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
+    given = headers.get("x-api-key")
+    if not isinstance(given, str):
+        return False
+    # 按字节比较：带非 ASCII 字符的 str 会让 compare_digest 抛 TypeError（变成 500 而不是 401）。
+    return hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _prices():
-    """行情表只在冷启动读一次；请求路径上不再打 S3。"""
-    global _PRICES
-    if _PRICES is None:
-        import pandas as pd
-
+    """行情表只读一次；读失败返回 None，PRICES_RETRY_SEC 之内不再打 S3。"""
+    global _PRICES, _PRICES_RETRY_AT
+    if _PRICES is not None:
+        return _PRICES
+    now = _now()
+    if now < _PRICES_RETRY_AT:
+        return None
+    try:
         obj = _s3.get_object(Bucket=os.environ["QUANTAI_S3_BUCKET"], Key="exports/fact_prices.csv")
         df = pd.read_csv(BytesIO(obj["Body"].read()), parse_dates=["date"])
-        _PRICES = df.sort_values("date")
+    except Exception as exc:  # noqa: BLE001 - 读不到就 503，稍后再试
+        print(f"[api] 行情表不可用，{PRICES_RETRY_SEC:.0f} 秒后重试：{type(exc).__name__}")
+        _PRICES_RETRY_AT = now + PRICES_RETRY_SEC
+        return None
+    _PRICES = df.sort_values("date")
     return _PRICES
 
 
 def _options_price(body: dict) -> dict:
-    from quantai.analysis.options import bs_greeks, bs_price
-
     try:
         S, K, T = float(body["S"]), float(body["K"]), float(body["T"])
         sigma = float(body["sigma"])
+        kwargs = {"r": float(body["r"])} if "r" in body else {}
     except (KeyError, TypeError, ValueError) as exc:
-        return _json(400, {"error": f"S/K/T/sigma 必填且须为数字：{exc}"})
+        return _json(400, {"error": f"S/K/T/sigma 必填且须为数字，r 可选且须为数字：{exc}"})
     kind = str(body.get("kind", "call"))
-    kwargs = {"r": float(body["r"])} if "r" in body else {}
     try:
         price = bs_price(S, K, T, sigma, kind, **kwargs)
         greeks = bs_greeks(S, K, T, sigma, kind, **kwargs)
@@ -93,12 +138,12 @@ def _options_price(body: dict) -> dict:
 
 
 def _signals(body: dict) -> dict:
-    from quantai.signals.generator import SignalGenerator
-
     symbol = str(body.get("symbol", "")).upper()
     if not symbol:
         return _json(400, {"error": "symbol 必填"})
     df = _prices()
+    if df is None:
+        return _json(503, {"error": "行情表暂时不可用，请稍后重试"})
     sub = df[df["symbol"] == symbol]
     if sub.empty:
         return _json(404, {"error": f"仓库里没有 {symbol} 的行情"})
