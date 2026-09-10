@@ -87,8 +87,9 @@ Resources:
                   - ecr:BatchGetImage
                   - ecr:GetDownloadUrlForLayer
                   - ecr:GetRepositoryPolicy
-                  - ecr:SetRepositoryPolicy
-                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepoPrefix}*
+                  # 不给 ecr:SetRepositoryPolicy：仓库策略由本栈声明（AllowLambdaSLR），Lambda 不需要改它；
+                  # 真要改时部署会直接失败，而不是悄悄改写一个 CloudFormation 管着的资源。
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepoPrefix}/*
               - Sid: RolesInAppNamespace
                 Effect: Allow
                 Action:
@@ -258,7 +259,7 @@ Resources:
                   - ecr:InitiateLayerUpload
                   - ecr:PutImage
                   - ecr:UploadLayerPart
-                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepoPrefix}*
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepoPrefix}/*
               - Sid: SmokeTestReadsFunctionState
                 Effect: Allow
                 Action: lambda:GetFunctionConfiguration
