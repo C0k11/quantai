@@ -375,7 +375,10 @@ instead of calling `PutMetricData`: no extra API call on the request path, and t
 execution role needs no `cloudwatch:PutMetricData`. The metric that matters is
 `NewsFeedFailures`: the RSS fetch degrades gracefully and still exits 0, so on a
 schedule it would silently lose rows. That alarm fired on a real feed failure
-during benchmarking and the email was delivered.
+during benchmarking and the email was delivered. The failing
+source turned out to be a config entry that called Yahoo's per-symbol news feed
+without a symbol: it returned HTTP 400 on every run, including all 63 local runs
+since July, and nothing had ever flagged it. The entry is removed.
 
 **Least privilege.** The ETL and API run under separate roles. S3 access is
 `GetObject`/`PutObject` on three prefixes of one bucket (the API role: read
