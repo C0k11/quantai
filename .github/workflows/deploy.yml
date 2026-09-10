@@ -58,6 +58,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Assume deploy role via OIDC (no long-lived keys)
+        id: aws
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
@@ -108,3 +109,39 @@ jobs:
             -H 'content-type: application/json' -d '{"S":100,"K":100,"T":0.5,"sigma":0.2}')
           echo "unauthenticated POST /options/price -> $code"
           [ "$code" = "401" ] || { echo "::error::expected 401, got $code"; exit 1; }
+
+      - name: Pin the image each function runs
+        # ECR 生命周期规则 1 只护带 deployed 标签的镜像，这里把标签打在 Lambda 实际在跑的 digest 上。
+        # always()：部署或冒烟失败时函数仍在跑旧镜像，标签也要留在它身上。
+        # --image-digest：manifest 字节对不上时 ECR 直接拒绝，而不是悄悄生成一张新镜像去打标签。
+        # 函数跑的镜像不在 CI 仓库里（例如迁移中途失败）只告警不打标签。输出不含仓库 URI。
+        if: ${{ always() && steps.aws.outcome == 'success' }}
+        env:
+          ETL_REPO_URI: ${{ secrets.ECR_ETL_REPO }}
+          API_REPO_URI: ${{ secrets.ECR_API_REPO }}
+        run: |
+          set -uo pipefail
+          pin() {
+            fn=$1; repo=$2
+            sha=$(aws lambda get-function-configuration --function-name "$fn" --query CodeSha256 --output text) || return 1
+            digest="sha256:$sha"
+            img=$(aws ecr batch-get-image --repository-name "$repo" --image-ids imageDigest="$digest" \
+                    --query 'images[0]' --output json) || return 1
+            if [ "$img" = "null" ]; then
+              echo "::warning::$fn runs an image outside its CI repository; not pinned"; return 0
+            fi
+            jq -j '.imageManifest' <<<"$img" > "$RUNNER_TEMP/manifest.json"
+            mtype=$(jq -r '.imageManifestMediaType' <<<"$img")
+            if out=$(aws ecr put-image --repository-name "$repo" --image-tag deployed --image-digest "$digest" \
+                       --image-manifest-media-type "$mtype" --image-manifest "file://$RUNNER_TEMP/manifest.json" 2>&1 >/dev/null); then
+              echo "$fn: pinned ${sha:0:12}"
+            elif grep -q ImageAlreadyExistsException <<<"$out"; then
+              echo "$fn: already pinned ${sha:0:12}"
+            else
+              echo "::error::$fn: put-image failed"; sed -E 's/[0-9]{12}/***/g' <<<"$out"; return 1
+            fi
+          }
+          rc=0
+          pin quantai-etl-etl "${ETL_REPO_URI#*/}" || rc=1
+          pin quantai-etl-api "${API_REPO_URI#*/}" || rc=1
+          exit $rc
