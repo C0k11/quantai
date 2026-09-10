@@ -1,0 +1,104 @@
+name: deploy
+
+# 测试 -> 构建镜像 -> 部署 -> 冒烟。
+# 没有任何长期 AWS 密钥：deploy 这一步用 GitHub 签发的 OIDC token 现场换 1 小时的
+# 短期凭据，而且 AWS 那边的信任策略只放行本仓库 main 分支签出来的 token。
+#
+# 仓库里不出现账号 ID / 桶名 / 仓库 URI：全部放在 repository secrets 里（不是 variables），
+# 因为 public 仓库的 Actions 日志是公开的，secret 的值会被自动打码，variable 不会。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'aws/**'
+      - 'quantai/**'
+      - 'scripts/**'
+      - 'warehouse/**'
+      - 'configs/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+# 同一时间只允许一个部署在跑，后来的排队，不互相踩 changeset。
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install
+        run: pip install -e ".[ui,warehouse,serve,dev]"
+      - name: Test (includes the position-boundary tests)
+        run: python -m pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # 只有这个 job 能向 GitHub 要 OIDC token；test job 拿不到。
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume deploy role via OIDC (no long-lived keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ca-central-1
+          mask-aws-account-id: true
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Build images
+        run: sam build --template-file aws/template.yaml
+
+      - name: Deploy through CloudFormation (execution role creates the resources)
+        run: >
+          sam deploy
+          --stack-name quantai-etl
+          --region ca-central-1
+          --role-arn "${{ secrets.CFN_EXEC_ROLE_ARN }}"
+          --s3-bucket "${{ secrets.SAM_ARTIFACT_BUCKET }}"
+          --image-repositories "EtlFunction=${{ secrets.ECR_ETL_REPO }}"
+          --image-repositories "ApiFunction=${{ secrets.ECR_API_REPO }}"
+          --capabilities CAPABILITY_IAM
+          --parameter-overrides
+          "DataBucket=${{ secrets.DATA_BUCKET }}"
+          "AlarmEmail=${{ secrets.ALARM_EMAIL }}"
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          for fn in quantai-etl-etl quantai-etl-api; do
+            state=$(aws lambda get-function-configuration --function-name "$fn" \
+              --query '[State,LastUpdateStatus]' --output text)
+            echo "$fn: $state"
+            [ "$state" = "Active	Successful" ] || { echo "::error::$fn not healthy"; exit 1; }
+          done
+          endpoint=$(aws cloudformation describe-stacks --stack-name quantai-etl \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" --output text)
+          # CI 故意不持有 API key：没 key 必须 401。这同时证明服务活着、且鉴权是 fail closed。
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$endpoint/options/price" \
+            -H 'content-type: application/json' -d '{"S":100,"K":100,"T":0.5,"sigma":0.2}')
+          echo "unauthenticated POST /options/price -> $code"
+          [ "$code" = "401" ] || { echo "::error::expected 401, got $code"; exit 1; }

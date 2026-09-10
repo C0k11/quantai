@@ -1,0 +1,25 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Account-level GitHub Actions OIDC identity provider. One per AWS account;
+  every repo's deploy role trusts it, so it lives in its own stack and is never
+  torn down with an application stack.
+
+# 部署一次、账号级、所有仓共用（QuantAI 与 credit-default 各自的部署角色都信任它）。
+# 单独成栈是为了：删掉任何一个应用的 CI 栈，都不会连带删掉别的仓还在用的 provider。
+#
+#   aws cloudformation deploy --stack-name github-oidc-provider \
+#     --template-file aws/bootstrap/github-oidc-provider.yaml --region ca-central-1
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      # 只接受签给 STS 的 token；GitHub 的 configure-aws-credentials 默认就用这个 audience。
+      ClientIdList: [sts.amazonaws.com]
+
+Outputs:
+  ProviderArn:
+    Value: !Ref GitHubOidcProvider
+    Export:
+      Name: github-oidc-provider-arn
