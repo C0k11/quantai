@@ -162,3 +162,6 @@ phase0_*.txt
 *.tfstate
 *.tfstate.*
 *.tfvars
+
+# 本机 AWS 资源名（桶名不进仓库）
+.aws-bucket-name.local
