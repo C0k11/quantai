@@ -401,9 +401,10 @@ boundary.
 bootstrap owns the OIDC provider, the CI roles and the image repositories, Terraform
 owns the data-lake bucket and budgets. The bucket and budgets were created by hand first and brought under
 Terraform with `import` blocks; the first plan showed zero changes for the bucket.
-Importing the budgets also fixed their cost basis: they had counted credits, so the
-$100 signup credit held them at $0 and the $1 alarm could never fire. They now track
-gross cost before credits.
+Importing the budgets also fixed their cost basis: they counted spend after credits,
+so until the $100 signup credit ran out the $1 alarm could not fire. The console could
+not exclude credits on a new account (that filter needs Cost Explorer data), so this was
+a known gap until the import; they now track gross cost before credits.
 
 ### Measured
 
@@ -436,7 +437,8 @@ is not passed, so changing only the default left the live function at 1769 MB.
 
 Cold starts are forced by changing an environment variable between invokes. The
 benchmark restores the original configuration, and CloudFormation drift detection
-afterwards reports all 15 stack resources in sync.
+afterwards reports all 15 resources it can check in sync (the 16th, the SNS email
+subscription, is outside what drift detection covers).
 
 **The first calls after a deploy are slower.** On a freshly deployed image the first five
 authenticated `/options/price` cold starts took 7.2, 6.0, 2.1, 2.2 and 2.0 s in the handler
