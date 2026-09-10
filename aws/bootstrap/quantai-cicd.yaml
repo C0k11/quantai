@@ -138,10 +138,16 @@ Resources:
                   - logs:TagResource
                   - logs:UntagResource
                   - logs:ListTagsForResource
+                  - logs:GetDataProtectionPolicy
                 Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppStackName}-*
-              - Sid: DescribeLogGroupsIsAListCall
+              - Sid: LogReadsWithoutResourceScope
+                # 栈有服务角色后，drift detection 也以这个角色跑 LogGroup 的 read handler。
+                # 这三个动作按 AWS Service Authorization Reference 只支持 Resource '*'，且都只读。
                 Effect: Allow
-                Action: logs:DescribeLogGroups
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeIndexPolicies
+                  - logs:DescribeResourcePolicies
                 Resource: '*'
               - Sid: AlarmTopic
                 Effect: Allow
@@ -163,6 +169,8 @@ Resources:
                   - cloudwatch:PutMetricAlarm
                   - cloudwatch:DeleteAlarms
                   - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                  - cloudwatch:ListTagsForResource
                 Resource: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AppStackName}-*
               - Sid: DescribeAlarmsIsAListCall
                 Effect: Allow
