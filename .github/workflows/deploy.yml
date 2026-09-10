@@ -73,20 +73,24 @@ jobs:
         run: sam build --template-file aws/template.yaml
 
       - name: Deploy through CloudFormation (execution role creates the resources)
-        run: >
-          sam deploy
-          --stack-name quantai-etl
-          --region ca-central-1
-          --role-arn "${{ secrets.CFN_EXEC_ROLE_ARN }}"
-          --s3-bucket "${{ secrets.SAM_ARTIFACT_BUCKET }}"
-          --image-repositories "EtlFunction=${{ secrets.ECR_ETL_REPO }}"
-          --image-repositories "ApiFunction=${{ secrets.ECR_API_REPO }}"
-          --capabilities CAPABILITY_IAM
-          --parameter-overrides
-          "DataBucket=${{ secrets.DATA_BUCKET }}"
-          "AlarmEmail=${{ secrets.ALARM_EMAIL }}"
-          --no-confirm-changeset
-          --no-fail-on-empty-changeset
+        # sam deploy 结束时打印栈 Outputs，其中 ApiEndpoint 不含账号 ID，不会被自动打码；
+        # public 仓库日志公开，所以把 execute-api 的 API ID 换成 ***（CI #3/#4 实测各漏过一次）。
+        run: |
+          set -euo pipefail
+          sam deploy \
+            --stack-name quantai-etl \
+            --region ca-central-1 \
+            --role-arn "${{ secrets.CFN_EXEC_ROLE_ARN }}" \
+            --s3-bucket "${{ secrets.SAM_ARTIFACT_BUCKET }}" \
+            --image-repositories "EtlFunction=${{ secrets.ECR_ETL_REPO }}" \
+            --image-repositories "ApiFunction=${{ secrets.ECR_API_REPO }}" \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides \
+            "DataBucket=${{ secrets.DATA_BUCKET }}" \
+            "AlarmEmail=${{ secrets.ALARM_EMAIL }}" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            2>&1 | sed -E 's#https://[a-z0-9]+\.execute-api\.#https://***.execute-api.#g'
 
       - name: Smoke test
         run: |
