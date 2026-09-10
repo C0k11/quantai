@@ -165,3 +165,6 @@ phase0_*.txt
 
 # 本机 AWS 资源名（桶名不进仓库）
 .aws-*.local
+
+# Terraform backend 本机配置（含 state 桶名）
+*.local.hcl

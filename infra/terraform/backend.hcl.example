@@ -1,0 +1,3 @@
+# Copy to backend.local.hcl (gitignored) and fill in, then:
+#   terraform init -backend-config=backend.local.hcl
+bucket = "your-terraform-state-bucket"
