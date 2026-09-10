@@ -329,6 +329,7 @@ flowchart TB
     DEP -->|"passes"| CFN["CloudFormation execution role<br/>creates the resources"]
     CFN --> APP["SAM stack: Lambdas, API, roles, logs, schedule, alarms"]
     APP --> SMOKE["smoke test: both functions Active,<br/>unauthenticated call returns 401"]
+    SMOKE --> PIN["tag the image each function runs<br/>as deployed, exempt from expiry"]
 ```
 
 ### What runs where
@@ -342,7 +343,7 @@ flowchart TB
 | API secret | SSM Parameter Store (SecureString) | Only the parameter *name* is in the template |
 | Observability | CloudWatch + SNS | Embedded Metric Format metrics, 2 alarms, email |
 | App IaC | SAM (`aws/template.yaml`) | Lambdas, API, roles, logs, schedule, alarms |
-| CI bootstrap | CloudFormation (`aws/bootstrap/`) | GitHub OIDC provider, deploy role, CloudFormation execution role |
+| CI bootstrap | CloudFormation (`aws/bootstrap/`) | GitHub OIDC provider, deploy role, CloudFormation execution role, ECR repositories |
 | Account IaC | Terraform (`infra/terraform/`) | Data-lake bucket and both budget alarms; remote state in S3 with native locking |
 | CI/CD | GitHub Actions (`.github/workflows/deploy.yml`) | Tests gate the deploy; OIDC federation, no long-lived AWS keys |
 
@@ -397,8 +398,8 @@ execution role can create roles under the app prefix without a permissions
 boundary.
 
 **One owner per resource.** SAM owns the application, a small CloudFormation
-bootstrap owns the OIDC provider and CI roles, Terraform owns the data-lake bucket
-and budgets. The bucket and budgets were created by hand first and brought under
+bootstrap owns the OIDC provider, the CI roles and the image repositories, Terraform
+owns the data-lake bucket and budgets. The bucket and budgets were created by hand first and brought under
 Terraform with `import` blocks; the first plan showed zero changes for the bucket.
 Importing the budgets also fixed their cost basis: they had counted credits, so the
 $100 signup credit held them at $0 and the $1 alarm could never fire. They now track
@@ -427,16 +428,35 @@ is not passed, so changing only the default left the live function at 1769 MB.
 | ETL cold start (Init Duration) | 537 to 1057 ms over 5 cold starts (4 memory tiers plus the first deploy), n=1 each; too few for a p95 |
 | API cold start (Init Duration) | Median 580 ms, p95 704 ms, max 726 ms over 20 forced cold starts at 1024 MB |
 | API warm invoke, 401 path | 1.07 ms median duration (n=30), 97 MB peak memory |
-| API compute latency | Not measured: the API key has not been created in SSM, so only the unauthenticated path has run in the cloud |
+| `POST /options/price`, authenticated | Cold: Init median 636 ms (p95 755), handler median 2044 ms (p95 2180) over 20 forced cold starts; warm: 1.8 ms median (p95 2.7) over 30; 250 MB peak |
+| `POST /signals`, authenticated | Cold: Init median 603 ms (p95 716), handler median 905 ms (p95 1160) over 20, one first-after-deploy call 5.6 s; warm: 8.4 ms median (p95 9.2) over 30; 176 MB peak |
 | ETL cost at 1024 MB, 22 runs/month | USD 0.0093 at list price; inside the Lambda free tier, billed USD 0 |
-| Image storage (ECR) | 4.52 GiB across 12 images, 2 of them live; at most USD 0.45/month at list price (per-image sizes, so shared layers count twice) |
+| Image storage (ECR) | 0.74 GiB per deploy (one ETL and one API image); the lifecycle rule caps it at 5 images per repository, 6 at worst: 3.68 to 4.42 GiB, USD 0.37 to 0.44/month at list price (per-image sizes, so shared layers count twice) |
 | HTTP API | USD 1.11 per million requests (list price) |
 
 Cold starts are forced by changing an environment variable between invokes. The
 benchmark restores the original configuration, and CloudFormation drift detection
 afterwards reports all 15 stack resources in sync.
 
-Known gap: the image repositories have no lifecycle policy, so each deploy adds about 0.74 GiB that nothing deletes, including images from a deploy that failed after pushing. Small in money, unbounded in principle, not fixed yet.
+**The first calls after a deploy are slower.** On a freshly deployed image the first five
+authenticated `/options/price` cold starts took 7.2, 6.0, 2.1, 2.2 and 2.0 s in the handler
+(Init 0.53 to 0.68 s each) before settling at the figures above; on the previous image the very
+first authenticated call hit the 15 s function timeout. The likely cause is Lambda loading
+container-image files on demand, so the first sandboxes to import SciPy and pandas from a new
+image pay for it. The effect is measured; the cause is inferred, not documented. Not fixed yet:
+a longer timeout or a warm-up call after each deploy would cover it. Separately,
+`/options/price` costs about 2 s on every cold start because its first call imports SciPy and
+the analysis package; warm calls take 1.8 ms at the median.
+
+**Image storage is bounded, and the running image cannot expire.** The repositories
+SAM created on the first deploy had no lifecycle rule and reached 12 images (4.52 GiB),
+including images pushed by a deploy that failed afterwards. They now live in the
+bootstrap stack with two rules: after every deploy CI tags the digest each function
+runs as `deployed`, rule 1 matches that tag, and rule 2 keeps the 5 most recent
+images. ECR never lets a lower-priority rule expire an image a higher-priority rule
+matched by tag, so a run of failed deploys cannot delete what Lambda is running. The
+repositories are retained if the stack is deleted or they are replaced; clearing
+images is always a separate manual step.
 
 Not validated end to end: the Lambda `Errors` alarm. It shares the SNS topic whose
 delivery was verified, but no real ETL failure has occurred to exercise the metric.
