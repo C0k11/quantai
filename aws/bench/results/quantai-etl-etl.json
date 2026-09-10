@@ -1,0 +1,124 @@
+{
+  "function": "quantai-etl-etl",
+  "route": null,
+  "region": "ca-central-1",
+  "measured_at": "2026-09-10T07:14:25+00:00",
+  "sweep": [
+    {
+      "memory_mb": 3008,
+      "statuses": [],
+      "cold_init_ms": {
+        "n": 1,
+        "min": 992.56,
+        "median": 992.56,
+        "max": 992.56
+      },
+      "cold_duration_ms": {
+        "n": 1,
+        "min": 23286.18,
+        "median": 23286.18,
+        "max": 23286.18
+      },
+      "warm_duration_ms": {
+        "n": 3,
+        "min": 17049.44,
+        "median": 17091.33,
+        "max": 17175.93
+      },
+      "warm_billed_ms": {
+        "n": 3,
+        "min": 17050.0,
+        "median": 17092.0,
+        "max": 17176.0
+      },
+      "max_used_mb": 534
+    },
+    {
+      "memory_mb": 1769,
+      "statuses": [],
+      "cold_init_ms": {
+        "n": 1,
+        "min": 686.86,
+        "median": 686.86,
+        "max": 686.86
+      },
+      "cold_duration_ms": {
+        "n": 1,
+        "min": 22069.06,
+        "median": 22069.06,
+        "max": 22069.06
+      },
+      "warm_duration_ms": {
+        "n": 3,
+        "min": 18019.76,
+        "median": 18182.9,
+        "max": 18212.11
+      },
+      "warm_billed_ms": {
+        "n": 3,
+        "min": 18020.0,
+        "median": 18183.0,
+        "max": 18213.0
+      },
+      "max_used_mb": 538
+    },
+    {
+      "memory_mb": 1024,
+      "statuses": [],
+      "cold_init_ms": {
+        "n": 1,
+        "min": 536.68,
+        "median": 536.68,
+        "max": 536.68
+      },
+      "cold_duration_ms": {
+        "n": 1,
+        "min": 30420.28,
+        "median": 30420.28,
+        "max": 30420.28
+      },
+      "warm_duration_ms": {
+        "n": 3,
+        "min": 25330.47,
+        "median": 25405.7,
+        "max": 25718.96
+      },
+      "warm_billed_ms": {
+        "n": 3,
+        "min": 25331.0,
+        "median": 25406.0,
+        "max": 25719.0
+      },
+      "max_used_mb": 531
+    },
+    {
+      "memory_mb": 512,
+      "statuses": [],
+      "cold_init_ms": {
+        "n": 1,
+        "min": 757.12,
+        "median": 757.12,
+        "max": 757.12
+      },
+      "cold_duration_ms": {
+        "n": 1,
+        "min": 57439.37,
+        "median": 57439.37,
+        "max": 57439.37
+      },
+      "warm_duration_ms": {
+        "n": 3,
+        "min": 49149.21,
+        "median": 49603.17,
+        "max": 49632.16
+      },
+      "warm_billed_ms": {
+        "n": 3,
+        "min": 49150.0,
+        "median": 49604.0,
+        "max": 49633.0
+      },
+      "max_used_mb": 511
+    }
+  ]
+}
