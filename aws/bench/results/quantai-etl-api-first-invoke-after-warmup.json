@@ -1,0 +1,62 @@
+{
+  "function": "quantai-etl-api",
+  "route": "options",
+  "region": "ca-central-1",
+  "code_sha256_prefix": "56bc51249b95",
+  "image_last_modified": "2026-09-10T21:29:46.000+0000",
+  "timeout_s_during_probe": 60,
+  "deployed_timeout_s": 20,
+  "measured_at": "2026-09-10T21:31:40+00:00",
+  "invocations": [
+    {
+      "client_wall_ms": 2546.0,
+      "function_error": null,
+      "timed_out": false,
+      "init_ms": 2249.76,
+      "duration_ms": 65.27,
+      "max_used_mb": 252,
+      "status": 200,
+      "n": 1
+    },
+    {
+      "client_wall_ms": 2322.7,
+      "function_error": null,
+      "timed_out": false,
+      "init_ms": 2059.48,
+      "duration_ms": 58.34,
+      "max_used_mb": 252,
+      "status": 200,
+      "n": 2
+    },
+    {
+      "client_wall_ms": 2239.4,
+      "function_error": null,
+      "timed_out": false,
+      "init_ms": 2009.34,
+      "duration_ms": 57.11,
+      "max_used_mb": 252,
+      "status": 200,
+      "n": 3
+    },
+    {
+      "client_wall_ms": 1796.0,
+      "function_error": null,
+      "timed_out": false,
+      "init_ms": 1598.44,
+      "duration_ms": 50.44,
+      "max_used_mb": 252,
+      "status": 200,
+      "n": 4
+    },
+    {
+      "client_wall_ms": 2154.6,
+      "function_error": null,
+      "timed_out": false,
+      "init_ms": 1879.69,
+      "duration_ms": 49.2,
+      "max_used_mb": 252,
+      "status": 200,
+      "n": 5
+    }
+  ]
+}

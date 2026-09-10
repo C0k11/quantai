@@ -328,7 +328,8 @@ flowchart TB
     OIDC --> DEP["deploy role<br/>push images, run change sets on one stack"]
     DEP -->|"passes"| CFN["CloudFormation execution role<br/>creates the resources"]
     CFN --> APP["SAM stack: Lambdas, API, roles, logs, schedule, alarms"]
-    APP --> SMOKE["smoke test: both functions Active,<br/>unauthenticated call returns 401"]
+    APP --> WARM["warm-up: 3 concurrent unauthenticated calls (401),<br/>new image loaded before real traffic"]
+    WARM --> SMOKE["smoke test: both functions Active,<br/>unauthenticated call returns 401"]
     SMOKE --> PIN["tag the image each function runs<br/>as deployed, exempt from expiry"]
 ```
 
@@ -430,10 +431,10 @@ is not passed, so changing only the default left the live function at 1769 MB.
 | | Value |
 |---|---|
 | ETL cold start (Init Duration) | 537 to 1057 ms over 5 cold starts (4 memory tiers plus the first deploy), n=1 each; too few for a p95 |
-| API cold start (Init Duration) | Median 580 ms, p95 704 ms, max 726 ms over 20 forced cold starts at 1024 MB |
-| API warm invoke, 401 path | 1.07 ms median duration (n=30), 97 MB peak memory |
-| `POST /options/price`, authenticated | Cold: Init median 636 ms (p95 755), handler median 2044 ms (p95 2180) over 20 forced cold starts; warm: 1.8 ms median (p95 2.7) over 30; 250 MB peak |
-| `POST /signals`, authenticated | Cold: Init median 603 ms (p95 716), handler median 905 ms (p95 1160) over 20, one first-after-deploy call 5.6 s; warm: 8.4 ms median (p95 9.2) over 30; 176 MB peak |
+| API cold start (Init Duration) | Median 1893 ms, p95 2025 ms, max 2044 ms over 20 forced cold starts at 1024 MB (401 path); the imports (SciPy, pandas, the signal code) run here, not in the first request |
+| API warm invoke, 401 path | 1.08 ms median duration (p95 1.26, n=30); 252 MB peak memory, since init now loads the libraries |
+| `POST /options/price`, authenticated | Cold: Init median 1964 ms (p95 2308), handler median 55 ms (p95 62) over 20 forced cold starts; warm: 1.77 ms median (p95 1.92) over 30; 252 MB peak |
+| `POST /signals`, authenticated | Cold: Init median 1941 ms (p95 2040), handler median 208 ms (p95 219) over 20 forced cold starts; warm: 8.63 ms median (p95 9.01) over 30; 262 MB peak |
 | ETL cost at 1024 MB, 22 runs/month | USD 0.0093 at list price; inside the Lambda free tier, billed USD 0 |
 | Image storage (ECR) | 0.74 GiB per deploy (one ETL and one API image); the lifecycle rule caps it at 5 images per repository, 6 at worst: 3.68 to 4.42 GiB, USD 0.37 to 0.44/month at list price (per-image sizes, so shared layers count twice) |
 | HTTP API | USD 1.11 per million requests (list price) |
@@ -443,15 +444,22 @@ benchmark restores the original configuration, and CloudFormation drift detectio
 afterwards reports all 15 resources it can check in sync (the 16th, the SNS email
 subscription, is outside what drift detection covers).
 
-**The first calls after a deploy are slower.** On a freshly deployed image the first five
-authenticated `/options/price` cold starts took 7.2, 6.0, 2.1, 2.2 and 2.0 s in the handler
-(Init 0.53 to 0.68 s each) before settling at the figures above; on the previous image the very
-first authenticated call hit the 15 s function timeout. The likely cause is Lambda loading
-container-image files on demand, so the first sandboxes to import SciPy and pandas from a new
-image pay for it. The effect is measured; the cause is inferred, not documented. Not fixed yet:
-a longer timeout or a warm-up call after each deploy would cover it. Separately,
-`/options/price` costs about 2 s on every cold start because its first call imports SciPy and
-the analysis package; warm calls take 1.8 ms at the median.
+**The first calls after a deploy used to be slow; CI now takes that hit.** On a freshly deployed
+image the first five authenticated `/options/price` cold starts once took 7.2, 6.0, 2.1, 2.2 and
+2.0 s in the handler, and on an earlier image the very first authenticated call hit the function
+timeout (then 15 s). The likely cause is Lambda loading container-image files on demand, so the
+first sandboxes to import SciPy and pandas from a new image pay for it; the effect is measured,
+the cause is inferred, not documented. The fix has two parts. The handler imports everything in
+the init phase and does no network I/O there, so any request, even one without a key, starts an
+environment that has loaded the libraries; the API key and the price table are read on the
+request path with short client timeouts and back-offs, and the function timeout is 20 s because
+a new environment serving `/signals` reads both, each bounded at about 9 s. CI then sends three
+concurrent unauthenticated requests after every deploy, each retried until it gets a 401. On the
+first deploy with this step each took about 6.8 s: the new-image penalty, paid by CI. Measured
+right after that deploy, five forced cold starts took 1.6 to 2.2 s of Init and 49 to 65 ms in
+the handler. The cost shows in the table: every cold start now pays about 2 s of Init, the 401
+path included. Summing the medians, cold `/options/price` went from about 2.7 s to 2.0 s and
+cold `/signals` from about 1.5 s to 2.1 s.
 
 **Image storage is bounded, and the running image cannot expire.** The repositories
 SAM created on the first deploy had no lifecycle rule and reached 12 images (4.52 GiB),
