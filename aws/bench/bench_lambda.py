@@ -52,20 +52,26 @@ _ROUTES = {
     "options": ("POST /options/price",
                 {"S": 100, "K": 105, "T": 0.5, "sigma": 0.25, "kind": "call"}),
     "signals": ("POST /signals", {"symbol": "SPY"}),
+    # 不带 key，期望 401。容器冷启动（Init Duration）发生在鉴权逻辑之前，所以拿不到 key 时
+    # 照样能测冷启动；但它**测不到计算路径的耗时**，那部分数字只能来自 options/signals。
+    "unauth": ("POST /options/price",
+               {"S": 100, "K": 105, "T": 0.5, "sigma": 0.25, "kind": "call"}),
 }
 
 
 def _api_event(route: str) -> bytes:
     """HTTP API v2 形状的最小事件。key 从 gitignore 的本地文件读，不打印、不落结果。"""
-    key_file = ROOT / ".aws-api-key.local"
-    if not key_file.exists():
-        raise SystemExit("缺 .aws-api-key.local：先用 aws ssm put-parameter 设好 API key")
     route_key, body = _ROUTES[route]
+    headers = {"content-type": "application/json"}
+    if route != "unauth":
+        key_file = ROOT / ".aws-api-key.local"
+        if not key_file.exists():
+            raise SystemExit("缺 .aws-api-key.local：先用 aws ssm put-parameter 设好 API key")
+        headers["x-api-key"] = key_file.read_text(encoding="utf-8").strip()
     return json.dumps({
         "version": "2.0",
         "routeKey": route_key,
-        "headers": {"x-api-key": key_file.read_text(encoding="utf-8").strip(),
-                    "content-type": "application/json"},
+        "headers": headers,
         "body": json.dumps(body),
         "isBase64Encoded": False,
     }).encode()
