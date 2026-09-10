@@ -42,7 +42,9 @@ jobs:
       - name: Install
         run: pip install -e ".[ui,warehouse,serve,dev]"
       - name: Test (includes the position-boundary tests)
-        run: python -m pytest -q
+        # pyproject 的 addopts 已带 -q；这里再加 -q 会叠成 -qq，pytest 就不打印
+        # "N passed" 汇总行，CI 日志里只剩退出码、没有条数可查。
+        run: python -m pytest
 
   deploy:
     needs: test
