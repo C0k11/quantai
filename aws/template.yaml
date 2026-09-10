@@ -20,14 +20,6 @@ Parameters:
     Type: String
     Default: America/New_York
     Description: Market-local timezone so the job tracks the close, not UTC drift.
-  MemorySize:
-    Type: Number
-    Default: 1024
-    Description: >
-      Measured cost knee (aws/bench/results/quantai-etl-etl.json). The job is IO-bound:
-      1024 MB costs about the same per run as 512 MB but runs twice as fast, and keeps
-      ~2x headroom over the measured 531 MB peak. 512 MB peaked at 511 MB - one MB
-      from OOM - so it is not an option.
   AlarmEmail:
     Type: String
     Default: ''
@@ -89,7 +81,11 @@ Resources:
       Role: !GetAtt EtlRole.Arn
       # 本地容器实测 17-22s；300s 给足余量又不至于挂死到 15 分钟上限。
       Timeout: 300
-      MemorySize: !Ref MemorySize
+      # 1024 MB = 实测成本拐点（aws/bench/results/quantai-etl-etl.json）：任务是 IO 瓶颈，
+      # 每次成本与 512 MB 基本持平但快一倍，对实测峰值 531 MB 留约 2x 余量；512 MB 峰值 511 MB，差 1 MB 就 OOM。
+      # 写死而不做成参数：改参数 Default 对已有栈不生效，sam deploy 对没显式传的参数沿用上次的值
+      # （CI #4 实测：Default 已改成 1024，线上仍是 1769）。
+      MemorySize: 1024
       # /tmp 要放云侧 duckdb（随新闻累积增长）+ CSV 导出。
       EphemeralStorage:
         Size: 1024
