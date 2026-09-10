@@ -1,0 +1,44 @@
+# 构建上下文最小化 + 边界防御：本地私有文件绝不进镜像。
+
+# 头寸与密钥（即使 Dockerfile 没 COPY，也不让它们进构建上下文）
+*.local.yaml
+*.env
+.env
+.aws-bucket-name.local
+
+# 数据与模型（GB 级，云侧自己重建）
+data/
+models/
+runs/
+logs/
+reports/
+exports/
+
+# 交付面与开发件
+.git/
+.github/
+docs/
+powerbi/
+notebooks/
+tests/
+venv311/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# dbt 本地产物（容器内重新生成）
+warehouse/target/
+warehouse/logs/
+warehouse/dbt_packages/
+
+# IaC 本机状态
+.aws-sam/
+samconfig.toml
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars

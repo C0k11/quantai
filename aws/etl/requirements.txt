@@ -1,0 +1,17 @@
+# 范围约束 + Dockerfile 的 --only-binary=:all:：让 pip 在 Lambda 平台上挑最新的
+# wheel。实际锁定版本见 requirements.lock.txt（从构建出的镜像 freeze 而来）。
+numpy>=1.24.0
+pandas>=2.0.0,<3
+pyarrow>=14.0.0
+scipy>=1.11.0
+yfinance>=0.2.36
+pandas_market_calendars>=4.0
+requests>=2.31.0
+feedparser>=6.0.0
+pydantic>=2.5.0
+pyyaml>=6.0.0
+duckdb>=1.0.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+tqdm>=4.66.0
+dbt-duckdb>=1.9.0

@@ -41,9 +41,40 @@ def test_no_positions_flag_blocks_them(captured, tmp_path):
 
 def test_full_respects_no_positions(captured, monkeypatch, tmp_path):
     """--full 展开成 load+dbt+export，边界开关不能在展开时被丢掉。"""
+    seen_export: dict = {}
     monkeypatch.setattr(warehouse_cli, "_run_dbt", lambda *a, **k: None)
-    monkeypatch.setattr(warehouse_cli, "_export", lambda *a, **k: None)
+    monkeypatch.setattr(
+        warehouse_cli, "_export",
+        lambda db, with_positions=True: seen_export.update(with_positions=with_positions),
+    )
 
     warehouse_cli.main(["--full", "--no-positions", "--db", str(tmp_path / "x.duckdb")])
 
     assert captured["with_positions"] is False
+    assert seen_export["with_positions"] is False, "导出端也必须尊重边界开关"
+
+
+def test_export_omits_positions_table(monkeypatch, tmp_path):
+    """云侧模式连 fact_positions.csv 这个文件名都不该出现。"""
+    copied: list[str] = []
+
+    class _FakeCon:
+        def execute(self, sql):
+            if sql.startswith("COPY"):
+                copied.append(sql.split("marts.")[1].split(")")[0])
+            return self
+
+        def fetchone(self):
+            return (0,)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(warehouse_cli, "_EXPORT_DIR", tmp_path)
+    import quantai.warehouse as qw
+    monkeypatch.setattr(qw, "connect", lambda *a, **k: _FakeCon())
+
+    warehouse_cli._export(tmp_path / "x.duckdb", with_positions=False)
+
+    assert "fact_positions" not in copied
+    assert "fact_prices" in copied

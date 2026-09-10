@@ -27,7 +27,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 _REPO = Path(__file__).resolve().parent.parent
 _DBT_DIR = _REPO / "warehouse"
 _DEFAULT_DB = _REPO / "data" / "warehouse" / "quantai.duckdb"
-_EXPORT_DIR = _REPO / "data" / "exports"
+# 导出目录可用 QUANTAI_EXPORT_DIR 覆盖：Lambda 的文件系统只读，只有 /tmp 能写。
+_EXPORT_DIR = Path(os.environ.get("QUANTAI_EXPORT_DIR") or (_REPO / "data" / "exports"))
 
 _MARTS = (
     "dim_date", "dim_symbol", "fact_prices", "fact_positions",
@@ -149,13 +150,20 @@ def _run_dbt(db_path: Path) -> None:
         raise SystemExit(f"dbt build 失败（exit {res.returncode}）")
 
 
-def _export(db_path: Path) -> None:
+def _export(db_path: Path, with_positions: bool = True) -> None:
+    """导出 marts -> CSV。
+
+    `with_positions=False` 时连 `fact_positions` 这张表都不导——云侧那张表本来
+    就是空的，但导出一个叫 fact_positions.csv 的文件会让下游的边界审计无法区分
+    "空表"和"真泄露"。让边界在源头就成立，而不是靠下游放宽判据。
+    """
     from quantai.warehouse import connect
 
+    tables = _MARTS if with_positions else tuple(t for t in _MARTS if t != "fact_positions")
     _EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     con = connect(db_path)
     try:
-        for t in _MARTS:
+        for t in tables:
             out = _EXPORT_DIR / f"{t}.csv"
             path_sql = out.as_posix().replace("'", "''")  # 路径含单引号时转义（SQL 字面量）
             con.execute(
@@ -199,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.dbt:
         _run_dbt(db_path)
     if args.export:
-        _export(db_path)
+        _export(db_path, with_positions=not args.no_positions)
     return 0
 
 
