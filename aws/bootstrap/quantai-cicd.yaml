@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   QuantAI CI/CD identities: a GitHub Actions deploy role that only the main
-  branch of one repo can assume, and a CloudFormation execution role that is
-  the only principal allowed to create the application's resources.
+  branch of one repo can assume, a CloudFormation execution role that is
+  the only principal allowed to create the application's resources, and the
+  two ECR repositories the deploy pushes images to.
 
 # 两个角色，把权限拆开：
 #
@@ -263,7 +264,58 @@ Resources:
                 Action: lambda:GetFunctionConfiguration
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*
 
+  # 两个镜像仓库归这个引导栈管。此前是 sam deploy --resolve-image-repos 自动建的 companion 栈，
+  # 没有生命周期策略，每次部署永久多约 0.74 GiB（含部署失败时已推上去的镜像）。
+  # 仓库必须先于应用栈存在：sam deploy 在建 changeset 之前就推镜像，所以不能放进应用栈。
+  # 名字落在 EcrRepoPrefix 之下，上面两个角色的 ECR 权限不用改。
+  #
+  # 生命周期两条规则：CI 每次部署后给 Lambda 实际在跑的镜像打 deployed 标签（可变标签，同一时刻只有一张有）。
+  # ECR 规定：被高优先级规则按标签匹配到的镜像，低优先级规则不能让它过期。所以规则 1 护住在跑的镜像，
+  # 规则 2 只保留最近 5 张；正常情况 5 张，最坏（在跑的那张不在最近 5 张里）6 张。
+  # 文本写成 ECR 返回的紧凑单行 JSON：带空格的写法会被 ECR 压缩存储，drift 检测会报假漂移。
+  #
+  # 删除和替换一律保留资源，也不开清空仓库的开关：仓库里是 Lambda 正在用的唯一镜像，
+  # 删栈、改前缀、回滚都不许顺手清空它们，清理必须是单独的手动步骤。
+  # 仓库策略与 SAM companion 仓库原样一致（AllowLambdaSLR），Lambda 拉镜像靠它。
+  EtlImageRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub ${EcrRepoPrefix}/etl
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Never expire the image Lambda runs","selection":{"tagStatus":"tagged","tagPatternList":["deployed"],"countType":"imageCountMoreThan","countNumber":1},"action":{"type":"expire"}},{"rulePriority":2,"description":"Keep the 5 most recent images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}'
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaSLR
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: [ecr:GetDownloadUrlForLayer, ecr:GetRepositoryPolicy, ecr:BatchGetImage]
+
+  ApiImageRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub ${EcrRepoPrefix}/api
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Never expire the image Lambda runs","selection":{"tagStatus":"tagged","tagPatternList":["deployed"],"countType":"imageCountMoreThan","countNumber":1},"action":{"type":"expire"}},{"rulePriority":2,"description":"Keep the 5 most recent images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}'
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaSLR
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: [ecr:GetDownloadUrlForLayer, ecr:GetRepositoryPolicy, ecr:BatchGetImage]
+
 Outputs:
+  EtlImageRepoUri:
+    Value: !GetAtt EtlImageRepo.RepositoryUri
+  ApiImageRepoUri:
+    Value: !GetAtt ApiImageRepo.RepositoryUri
   DeployRoleArn:
     Value: !GetAtt GitHubDeployRole.Arn
   CfnExecutionRoleArn:
