@@ -95,6 +95,38 @@ jobs:
             --no-fail-on-empty-changeset \
             2>&1 | sed -E 's#https://[a-z0-9]+\.execute-api\.#https://***.execute-api.#g'
 
+      - name: Warm up the API image
+        # init 阶段会导入 scipy、pandas 和信号模块，所以一个不带 key 的请求（401）就能预热一个执行环境。
+        # 新镜像的头几个执行环境要付一次冷加载代价（实测首调 7.2 s、6.0 s，之后约 2 s），这里并发打三路，
+        # 每路重试到拿到 401 为止，让这笔代价落在 CI 上而不是第一个真实请求上；CI 不持有 API key。
+        # 尽力而为：失败只告警，不把已经成功的部署标红。地址和 API id 先打码，输出只有状态码、耗时和 curl 退出码。
+        # Actions 默认 bash -e：curl 传输层失败（超时等）会让这一路静默退出，所以 curl 那一行必须 || true。
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          endpoint=$(aws cloudformation describe-stacks --stack-name quantai-etl \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" --output text)
+          echo "::add-mask::$endpoint"
+          api_id=${endpoint#https://}; api_id=${api_id%%.*}
+          if [ -n "$api_id" ]; then echo "::add-mask::$api_id"; fi
+          warm() {
+            local seen=""
+            for attempt in 1 2 3 4 5 6; do
+              res=$(curl -s -o /dev/null -w '%{http_code} %{time_total}s rc=%{exitcode}' --max-time 35 -X POST \
+                      "$endpoint/options/price" -H 'content-type: application/json' -d '{}') || true
+              echo "warm-up $1 attempt $attempt: $res"
+              if [ "${res%% *}" = "401" ]; then
+                if [ -n "$seen" ]; then echo "::warning::warm-up $1 needed $attempt attempts (earlier:$seen)"; fi
+                return 0
+              fi
+              seen="$seen ${res%% *}"
+              if [ "$attempt" -lt 6 ]; then sleep 5; fi
+            done
+            echo "::warning::warm-up $1 never got a 401 (codes:$seen)"
+          }
+          for i in 1 2 3; do warm "$i" & done
+          wait
+
       - name: Smoke test
         run: |
           set -euo pipefail
