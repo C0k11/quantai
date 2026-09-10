@@ -151,3 +151,14 @@ docs/engineering_log_phase2_cn_infusion.md
 每日决策日志.bat
 盘中快评.bat
 scripts/run_hidden.vbs
+
+# AWS/SAM 构建产物与本机部署配置（含账号 ID/桶名，永不入库）
+.aws-sam/
+samconfig.toml
+phase0_*.txt
+
+# Terraform 本机状态与变量（含账号 ID）
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
