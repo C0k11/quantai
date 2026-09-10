@@ -3,7 +3,9 @@
 **A personal quant workbench in two surfaces: a real-time trading console with a
 local-LLM analyst (Streamlit - the product anyone can clone and run), backed by a
 reconciled offline BI artifact (Power BI over a DuckDB/dbt star schema).**
-US equities (NYSE calendar), typed and tested (748 tests), honest by design.
+US equities (NYSE calendar), typed and tested (757 tests), honest by design. The nightly ETL and a small
+compute API run on AWS Lambda, deployed by GitHub Actions over OIDC
+([details](#cloud-deployment-aws)).
 
 | Frontend - live workstation (Streamlit) | Power BI - offline analysis artifact |
 |---|---|
@@ -12,7 +14,7 @@ US equities (NYSE calendar), typed and tested (748 tests), honest by design.
 
 *Frontend screenshots use the bundled `portfolio.example.yaml` - no real holdings shown.*
 
--> [Quick start](#quick-start) - [Two surfaces, one warehouse](#two-surfaces-one-warehouse) - [Architecture](#architecture)
+-> [Quick start](#quick-start) - [Two surfaces, one warehouse](#two-surfaces-one-warehouse) - [Architecture](#architecture) - [Cloud deployment](#cloud-deployment-aws)
 
 The codebase was rebuilt bottom-up into the typed, tested `quantai/` package;
 the pre-rebuild tree is kept out of the repository entirely.
@@ -297,6 +299,150 @@ flowchart TB
   provably turn red when a join breaks. Free Desktop only: no Publish-to-web,
   so the deliverable is the project + screenshots, reproducible locally.
 
+## Cloud deployment (AWS)
+
+The nightly warehouse refresh and a small compute API run serverless in
+`ca-central-1`. This is a personal project, not a production system: one
+environment, one user, no on-call. Every number below was measured on the
+deployed stack; anything not measured says so.
+
+Runtime:
+
+```mermaid
+flowchart TB
+    EB["EventBridge Scheduler<br/>21:00 America/New_York, Mon-Fri"] --> ETL["Lambda: nightly ETL<br/>container image, --no-positions"]
+    ETL -->|"position-free exports + warehouse file"| S3["S3 data lake<br/>exports/ config/ warehouse/"]
+    ETL --> CW["CloudWatch<br/>EMF metrics, 2 alarms"]
+    CW --> SNS["SNS email"]
+    GW["HTTP API<br/>5 rps, burst 10"] --> FN["Lambda: compute API<br/>/options/price, /signals"]
+    FN -->|"read exports/"| S3
+    FN --> SSM["SSM SecureString<br/>API key"]
+```
+
+Deployment:
+
+```mermaid
+flowchart TB
+    PUSH["push to main"] --> TEST["GitHub Actions: pytest"]
+    TEST --> OIDC["OIDC token exchanged with STS<br/>1-hour session, main branch only"]
+    OIDC --> DEP["deploy role<br/>push images, run change sets on one stack"]
+    DEP -->|"passes"| CFN["CloudFormation execution role<br/>creates the resources"]
+    CFN --> APP["SAM stack: Lambdas, API, roles, logs, schedule, alarms"]
+    APP --> SMOKE["smoke test: both functions Active,<br/>unauthenticated call returns 401"]
+```
+
+### What runs where
+
+| Piece | Service | Notes |
+|---|---|---|
+| Nightly ETL | Lambda (container image) | Same `scripts/warehouse.py --full` as local, with `--no-positions` |
+| Schedule | EventBridge Scheduler | `cron(0 21 ? * MON-FRI *)` in `America/New_York`, so it tracks the close through DST |
+| Data lake | S3 | Versioned, all public access blocked, SSE-S3, TLS-only bucket policy |
+| Compute API | HTTP API + Lambda | `POST /options/price` (Black-Scholes + Greeks), `POST /signals`; 5 rps, burst 10 |
+| API secret | SSM Parameter Store (SecureString) | Only the parameter *name* is in the template |
+| Observability | CloudWatch + SNS | Embedded Metric Format metrics, 2 alarms, email |
+| App IaC | SAM (`aws/template.yaml`) | Lambdas, API, roles, logs, schedule, alarms |
+| CI bootstrap | CloudFormation (`aws/bootstrap/`) | GitHub OIDC provider, deploy role, CloudFormation execution role |
+| Account IaC | Terraform (`infra/terraform/`) | Data-lake bucket and both budget alarms; remote state in S3 with native locking |
+| CI/CD | GitHub Actions (`.github/workflows/deploy.yml`) | Tests gate the deploy; OIDC federation, no long-lived AWS keys |
+
+### Design decisions
+
+**Holdings never cross the local boundary.** `portfolio.local.yaml` and every
+position figure stay on this machine; the cloud tier only handles market data,
+news and warehouse products. This is enforced in code, not by convention:
+the cloud ETL runs with `--no-positions` (no `raw.positions` is ever produced),
+the export step omits `fact_positions` entirely, `dim_symbol.is_currently_held`
+is forced to False in anything published, and `scripts/s3_publish.py` audits the
+staging directory and aborts on a leak. Nine tests pin this. The cloud warehouse
+file was downloaded and inspected after deployment: 0 rows in `raw.positions` and
+`fact_positions`. Power BI therefore keeps reading local exports.
+
+**Container images, not zips.** Measured with `du` inside the images, the ETL
+adds 670 MB of unzipped dependencies (pandas, pyarrow, duckdb, dbt) and the API
+317 MB, against the 250 MB unzipped limit for zip deployments.
+
+**Lambda has no POSIX shared memory.** The image ran cleanly under local Docker
+and then failed on Lambda: dbt builds a `multiprocessing` RLock when it registers
+the adapter, and `SemLock` raises `PermissionError` without `/dev/shm`. dbt runs
+models on threads, not processes, so `aws/etl/sitecustomize.py` swaps in
+`threading` locks at interpreter start (dbt is a subprocess, so the handler
+cannot patch it). It only patches when `SemLock` is actually unavailable.
+
+**Metrics ride on log lines.** The ETL emits CloudWatch Embedded Metric Format
+instead of calling `PutMetricData`: no extra API call on the request path, and the
+execution role needs no `cloudwatch:PutMetricData`. The metric that matters is
+`NewsFeedFailures`: the RSS fetch degrades gracefully and still exits 0, so on a
+schedule it would silently lose rows. That alarm fired on a real feed failure
+during benchmarking and the email was delivered.
+
+**Least privilege.** The ETL and API run under separate roles. S3 access is
+`GetObject`/`PutObject` on three prefixes of one bucket (the API role: read
+`exports/` only); no `ListBucket`, no `DeleteObject`, no wildcard bucket; logs only
+into each function's own log group. `kms:Decrypt` cannot be scoped to the AWS
+managed key by resource, so a `kms:ViaService` condition pins it to SSM.
+
+**CI holds no AWS credentials.** GitHub Actions exchanges its OIDC token for a
+one-hour session, and only the deploy job, after the tests pass, may request
+one. The trust policy uses `StringEquals` on the full subject; GitHub issues this
+repository an immutable-ID subject
+(`repo:<owner>@<owner_id>/<repo>@<repo_id>:ref:refs/heads/main`), so a rename or a
+re-registered repository with the same name cannot inherit the trust. The deploy
+role cannot create resources itself: it can push images, upload the packaged
+template, and run change sets on one stack, passing a separate CloudFormation
+execution role that does the actual creation. Account-identifying values live in
+repository secrets, which the public Actions log masks, and the deploy step
+redacts the API endpoint from the stack-output table SAM prints. Known gap: the
+execution role can create roles under the app prefix without a permissions
+boundary.
+
+**One owner per resource.** SAM owns the application, a small CloudFormation
+bootstrap owns the OIDC provider and CI roles, Terraform owns the data-lake bucket
+and budgets. The bucket and budgets were created by hand first and brought under
+Terraform with `import` blocks; the first plan showed zero changes for the bucket.
+Importing the budgets also fixed their cost basis: they had counted credits, so the
+$100 signup credit held them at $0 and the $1 alarm could never fire. They now track
+gross cost before credits.
+
+### Measured
+
+ETL memory sweep (Lambda REPORT lines, `aws/bench/bench_lambda.py`; cost is
+billed duration times the AWS list price for `ca-central-1`):
+
+| Memory | Warm run (median, n=3) | Peak memory | GB-s per run | USD per 1,000 runs |
+|---|---|---|---|---|
+| 512 MB | 49.6 s | 511 MB | 24.8 | 0.414 |
+| **1024 MB** | 25.4 s | 531 MB | 25.4 | 0.424 |
+| 1769 MB | 18.2 s | 538 MB | 31.4 | 0.524 |
+| 3008 MB | 17.1 s | 534 MB | 50.2 | 0.837 |
+
+The job is IO-bound: 1.7x the memory buys 6% speed. 1024 MB costs about the same
+as 512 MB, runs twice as fast and keeps 2x headroom; 512 MB peaked one MB from its
+limit. The function is deployed at 1024 MB, set on the function itself rather than
+as a template parameter: `sam deploy` reuses a parameter's previous value when it
+is not passed, so changing only the default left the live function at 1769 MB.
+
+| | Value |
+|---|---|
+| ETL cold start (Init Duration) | 537 to 1057 ms over 5 cold starts (4 memory tiers plus the first deploy), n=1 each; too few for a p95 |
+| API cold start (Init Duration) | Median 580 ms, p95 704 ms, max 726 ms over 20 forced cold starts at 1024 MB |
+| API warm invoke, 401 path | 1.07 ms median duration (n=30), 97 MB peak memory |
+| API compute latency | Not measured: the API key has not been created in SSM, so only the unauthenticated path has run in the cloud |
+| ETL cost at 1024 MB, 22 runs/month | USD 0.0093 at list price; inside the Lambda free tier, billed USD 0 |
+| Image storage (ECR) | 4.52 GiB across 12 images, 2 of them live; at most USD 0.45/month at list price (per-image sizes, so shared layers count twice) |
+| HTTP API | USD 1.11 per million requests (list price) |
+
+Cold starts are forced by changing an environment variable between invokes. The
+benchmark restores the original configuration, and CloudFormation drift detection
+afterwards reports all 15 stack resources in sync.
+
+Known gap: the image repositories have no lifecycle policy, so each deploy adds about 0.74 GiB that nothing deletes, including images from a deploy that failed after pushing. Small in money, unbounded in principle, not fixed yet.
+
+Not validated end to end: the Lambda `Errors` alarm. It shares the SNS topic whose
+delivery was verified, but no real ETL failure has occurred to exercise the metric.
+
+Prices were read from the AWS Pricing API on 2026-09-10, not taken from memory.
+
 ## Integrity notes (deliberate, tested)
 
 - Backtest fills at **next open**: the legacy same-bar-close fill inflated returns
@@ -329,7 +475,9 @@ Chinese-first - honest boundary, on the roadmap.
 
 Real holdings (`portfolio.local.yaml`, any `*.local.yaml`), `.env` secrets, and
 generated data live outside version control via `.gitignore`. The repo ships
-only `portfolio.example.yaml`.
+only `portfolio.example.yaml`. The AWS deployment keeps the same boundary:
+holdings never leave this machine, and account IDs, bucket names and keys stay
+out of the repository ([details](#cloud-deployment-aws)).
 
 ## Requirements
 
