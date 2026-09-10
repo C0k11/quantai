@@ -6,6 +6,11 @@ Description: QuantAI nightly warehouse refresh on Lambda (container image).
 # 桶名走 parameter：本机部署从 gitignore 的 .aws-*.local 文件传入，CI 从 repository secret 传入。
 # 换个账号，同一份模板即可部署。
 
+# 镜像仓库归 aws/bootstrap/quantai-cicd.yaml 管（quantaietl/etl、quantaietl/api，带生命周期规则）。
+# 正常只走 CI 部署。手动 sam deploy 必须显式传 --image-repositories 指向这两个仓库，
+# 不要用 --resolve-image-repos 或 --guided 的默认值，否则 SAM 会另建一个没有生命周期的 companion 栈；
+# 手动部署后还要照 .github/workflows/deploy.yml 最后一步给在跑的镜像打 deployed 标签。
+
 Parameters:
   DataBucket:
     Type: String
