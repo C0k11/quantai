@@ -12,6 +12,8 @@ on:
     branches: [main]
     paths:
       - 'aws/**'
+      # 压测结果只是数据：提交它不该重新构建、推镜像、部署（顺序有意义，! 要写在 aws/** 之后）。
+      - '!aws/bench/**'
       - 'quantai/**'
       - 'scripts/**'
       - 'warehouse/**'
