@@ -3,12 +3,15 @@ Transform: AWS::Serverless-2016-10-31
 Description: QuantAI nightly warehouse refresh on Lambda (container image).
 
 # 源码里没有任何账号 ID / 桶名字面量：账号与区域走 CloudFormation 伪参数，
-# 桶名走 parameter（本机值在 gitignore 的 samconfig.toml 里）。换个账号同一份模板即可部署。
+# 桶名走 parameter：本机部署从 gitignore 的 .aws-*.local 文件传入，CI 从 repository secret 传入。
+# 换个账号，同一份模板即可部署。
 
 Parameters:
   DataBucket:
     Type: String
-    Description: Existing S3 data lake bucket (created out of band, later managed by Terraform).
+    Description: >
+      Existing S3 data lake bucket. Owned by Terraform (infra/terraform/);
+      SAM only references it by name and never creates or modifies it.
   ScheduleExpression:
     Type: String
     Default: cron(0 21 ? * MON-FRI *)
@@ -19,8 +22,12 @@ Parameters:
     Description: Market-local timezone so the job tracks the close, not UTC drift.
   MemorySize:
     Type: Number
-    Default: 1769
-    Description: 1769 MB is one full vCPU; Phase 6 sweeps this for the cost knee.
+    Default: 1024
+    Description: >
+      Measured cost knee (aws/bench/results/quantai-etl-etl.json). The job is IO-bound:
+      1024 MB costs about the same per run as 512 MB but runs twice as fast, and keeps
+      ~2x headroom over the measured 531 MB peak. 512 MB peaked at 511 MB - one MB
+      from OOM - so it is not an option.
   AlarmEmail:
     Type: String
     Default: ''
