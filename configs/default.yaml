@@ -19,7 +19,9 @@ data:
   price_source: "yfinance"    # US-only（旧 akshare/CN 路径已移除）
   news_source: "rss"
   news_feeds:
-    - "https://feeds.finance.yahoo.com/rss/2.0/headline"
+    # 这里只放不绑定标的的通用源；个股新闻走 quantai/data/news.py 的 YAHOO_TICKER_FEED。
+    # 曾有一条 Yahoo 的 rss/2.0/headline：那是个股接口，缺了必填的 ?s= 参数，每次都 400
+    # （本地 63 次、云上 17 次，从没产出过数据），已删除。
     - "https://www.cnbc.com/id/100003114/device/rss/rss.html"
   storage:
     type: "parquet"
