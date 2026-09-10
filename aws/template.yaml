@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: QuantAI nightly warehouse refresh on Lambda (container image).
+
+# 源码里没有任何账号 ID / 桶名字面量：账号与区域走 CloudFormation 伪参数，
+# 桶名走 parameter（本机值在 gitignore 的 samconfig.toml 里）。换个账号同一份模板即可部署。
+
+Parameters:
+  DataBucket:
+    Type: String
+    Description: Existing S3 data lake bucket (created out of band, later managed by Terraform).
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 21 ? * MON-FRI *)
+    Description: EventBridge Scheduler cron, evaluated in ScheduleTimezone.
+  ScheduleTimezone:
+    Type: String
+    Default: America/New_York
+    Description: Market-local timezone so the job tracks the close, not UTC drift.
+  MemorySize:
+    Type: Number
+    Default: 1769
+    Description: 1769 MB is one full vCPU; Phase 6 sweeps this for the cost knee.
+
+Resources:
+
+  EtlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-etl
+      # 默认永不过期会无声长胖；这个任务每天一条，14 天足够排障。
+      RetentionInDays: 14
+
+  EtlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        # 最小权限：只读写这一个桶的三个前缀，只写自己那个日志组。
+        # 没有 s3:ListBucket、没有 s3:DeleteObject、没有通配桶、没有 logs:* on *。
+        - PolicyName: etl-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadWriteOwnPrefixesOnly
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/exports/*
+                  - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/config/*
+                  - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/warehouse/*
+              - Sid: WriteOwnLogStreamOnly
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub ${EtlLogGroup.Arn}:*
+
+  EtlFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: EtlLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-etl
+      PackageType: Image
+      Role: !GetAtt EtlRole.Arn
+      # 本地容器实测 17-22s；300s 给足余量又不至于挂死到 15 分钟上限。
+      Timeout: 300
+      MemorySize: !Ref MemorySize
+      # /tmp 要放云侧 duckdb（随新闻累积增长）+ CSV 导出。
+      EphemeralStorage:
+        Size: 1024
+      Environment:
+        Variables:
+          QUANTAI_S3_BUCKET: !Ref DataBucket
+      Events:
+        Nightly:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Ref ScheduleExpression
+            ScheduleExpressionTimezone: !Ref ScheduleTimezone
+            Description: QuantAI nightly warehouse refresh (after US close).
+    Metadata:
+      # DockerContext 是仓库根：Dockerfile 要 COPY quantai/ scripts/ warehouse/ configs/
+      DockerContext: ..
+      Dockerfile: aws/etl/Dockerfile
+      DockerTag: latest
+
+Outputs:
+  FunctionName:
+    Value: !Ref EtlFunction
+  LogGroup:
+    Value: !Ref EtlLogGroup
+  RoleArn:
+    Value: !GetAtt EtlRole.Arn

@@ -1,12 +1,14 @@
-# 构建上下文最小化 + 边界防御：本地私有文件绝不进镜像。
+# Minimal build context + boundary defence: local private files never reach the image.
+# ASCII only - the SAM CLI reads this file with the system codepage, not UTF-8.
 
-# 头寸与密钥（即使 Dockerfile 没 COPY，也不让它们进构建上下文）
+# Holdings and secrets (kept out of the build context even though the Dockerfile
+# does not COPY them).
 *.local.yaml
 *.env
 .env
 .aws-bucket-name.local
 
-# 数据与模型（GB 级，云侧自己重建）
+# Data and models (GB scale; the cloud tier rebuilds its own).
 data/
 models/
 runs/
@@ -14,7 +16,7 @@ logs/
 reports/
 exports/
 
-# 交付面与开发件
+# Delivery surface and dev-only trees.
 .git/
 .github/
 docs/
@@ -30,12 +32,12 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
-# dbt 本地产物（容器内重新生成）
+# dbt local artifacts (regenerated inside the container).
 warehouse/target/
 warehouse/logs/
 warehouse/dbt_packages/
 
-# IaC 本机状态
+# IaC local state.
 .aws-sam/
 samconfig.toml
 .terraform/

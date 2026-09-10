@@ -18,6 +18,10 @@ COPY warehouse/ ${LAMBDA_TASK_ROOT}/warehouse/
 COPY configs/   ${LAMBDA_TASK_ROOT}/configs/
 COPY aws/etl/handler.py ${LAMBDA_TASK_ROOT}/handler.py
 
+# Lambda 没有 POSIX 共享内存，multiprocessing 的信号量锁会 PermissionError。
+# 放在 site-packages 里，解释器启动即生效——dbt 是子进程，从 handler 里 patch 不到。
+COPY aws/etl/sitecustomize.py /var/lang/lib/python3.11/site-packages/sitecustomize.py
+
 # 只读文件系统：所有写盘路径在 handler 里重定向到 /tmp
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
