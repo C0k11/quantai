@@ -52,6 +52,8 @@ Resources:
   EtlRole:
     Type: AWS::IAM::Role
     Properties:
+      # 权限边界归 aws/bootstrap/quantai-cicd.yaml 管：执行角色只能写带着这条边界的应用角色。
+      PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/quantai-cicd-app-boundary
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -104,6 +106,8 @@ Resources:
             ScheduleExpression: !Ref ScheduleExpression
             ScheduleExpressionTimezone: !Ref ScheduleTimezone
             Description: QuantAI nightly warehouse refresh (after US close).
+            # SAM 生成的定时器角色只能从这里拿到边界：函数显式指定了 Role，函数级或 Globals 的 PermissionsBoundary 不生效。
+            PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/quantai-cicd-app-boundary
     Metadata:
       # DockerContext 是仓库根：Dockerfile 要 COPY quantai/ scripts/ warehouse/ configs/
       DockerContext: ..
@@ -165,6 +169,47 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlarmTopic]
 
+  # 上面两个告警都要求函数真的跑了。下面两个抓"没跑"：定时器调了但失败，或者根本没调。
+  SchedulerTargetErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-schedule-target-error
+      AlarmDescription: >
+        EventBridge Scheduler tried to invoke the nightly ETL and failed. The function never ran,
+        so the Lambda Errors alarm cannot see it.
+      # 账号级指标（不带维度）：EtlFunctionNightly 是本区域唯一的定时器；以后加别的定时器，改成按 schedule group 告警。
+      Namespace: AWS/Scheduler
+      MetricName: TargetErrorCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  EtlNotInvokedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-etl-not-invoked
+      AlarmDescription: >
+        The nightly ETL has not been invoked for 3 days: the schedule was disabled, deleted or never
+        fired. Neither the Scheduler nor the Lambda error alarm can see a run that never started.
+      # 没有调用时 Lambda 不发 Invocations 数据点，所以缺数据就是没跑，按报警处理。3 个 1 天周期跨过周末：
+      # 纽约周五晚那次落在 UTC 周六，下一次落在 UTC 周二，中间最多空 2 天。
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref EtlFunction }
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+
   # --------------------------------------------------------------- 计算 API
 
   HttpApi:
@@ -185,6 +230,7 @@ Resources:
   ApiRole:
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/quantai-cicd-app-boundary
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
