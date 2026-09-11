@@ -409,10 +409,20 @@ redacts the API endpoint from the stack-output table SAM prints. The execution
 role can write only the three app roles (ETL, API, schedule), and only while each
 carries a fixed permissions boundary that caps it at the data-lake prefixes, the
 API key parameter, the app's log groups and invoking the ETL. It cannot remove the
-boundary, edit the boundary policy, or touch either CI role. Remaining exposure: a
-malicious template on `main` could still create a boundary-capped app role that
-trusts any principal, grant API Gateway invoke on a function without a source ARN,
-or add another HTTP API in the region.
+boundary, edit the boundary policy, touch either project's CI roles, or touch the other
+project's HTTP API. Remaining exposure: a malicious template on `main` could still create a
+boundary-capped app role that trusts any principal, add another HTTP API, or tag API
+Gateway resources in the region other than the other project's API.
+
+**Known gap: invoke grants without a source ARN.** The execution role may grant invoke
+on a function only to API Gateway, but IAM cannot pin which API: Lambda has no condition
+key for the source ARN. A template on `main` could grant invoke with no source ARN, or
+with another account's, so an API elsewhere could call the function outside this stage's
+throttle and use the account's shared concurrency. The practical fix is a CloudFormation
+Guard hook, owned by an administrator, that rejects a Lambda permission without this
+account's execute-api source ARN. It is not built: the gap matters only if someone can
+deploy a template through CI (push access to `main` or a compromised CI role), and a hook
+is one more component that can block deploys.
 
 **One owner per resource.** SAM owns the application, a small CloudFormation
 bootstrap owns the OIDC provider, the CI roles, the app-role boundary and the image repositories, Terraform
