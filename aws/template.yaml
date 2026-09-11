@@ -193,18 +193,19 @@ Resources:
     Properties:
       AlarmName: !Sub ${AWS::StackName}-etl-not-invoked
       AlarmDescription: >
-        The nightly ETL has not been invoked for 3 days: the schedule was disabled, deleted or never
+        The nightly ETL has not been invoked for 4 days: the schedule was disabled, deleted or never
         fired. Neither the Scheduler nor the Lambda error alarm can see a run that never started.
-      # 没有调用时 Lambda 不发 Invocations 数据点，所以缺数据就是没跑，按报警处理。3 个 1 天周期跨过周末：
-      # 纽约周五晚那次落在 UTC 周六，下一次落在 UTC 周二，中间最多空 2 天。
+      # 没有调用时 Lambda 不发 Invocations 数据点，所以缺数据就是没跑，按报警处理。用 4 个 1 天周期而不是 3 个：
+      # 纽约周五晚那次在 UTC 周六 01:00（冬令时 02:00），下一次在 UTC 周二同一时刻，中间正好 72 小时，
+      # 3 天正好卡在线上，周一晚新数据进来之前可能误报一次；4 天留出一整天余量，费用不变。
       Namespace: AWS/Lambda
       MetricName: Invocations
       Dimensions:
         - { Name: FunctionName, Value: !Ref EtlFunction }
       Statistic: Sum
       Period: 86400
-      EvaluationPeriods: 3
-      DatapointsToAlarm: 3
+      EvaluationPeriods: 4
+      DatapointsToAlarm: 4
       Threshold: 1
       ComparisonOperator: LessThanThreshold
       TreatMissingData: breaching
