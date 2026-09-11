@@ -2,28 +2,29 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   QuantAI CI/CD identities: a GitHub Actions deploy role that only the main
   branch of one repo can assume, a CloudFormation execution role that is
-  the only principal allowed to create the application's resources, and the
-  two ECR repositories the deploy pushes images to.
+  the only principal allowed to create the application's resources, the
+  permissions boundary every app role must carry, and the two ECR
+  repositories the deploy pushes images to.
 
 # 两个角色，把权限拆开：
 #
-#   GitHubDeployRole   ——  GitHub Actions 通过 OIDC 换来的短期凭据。它**自己不能**建
+#   CicdDeployRole     ——  GitHub Actions 通过 OIDC 换来的短期凭据。它**自己不能**建
 #                          Lambda、不能 iam:CreateRole；它只能 (1) 往构件桶和两个 ECR 仓推
 #                          东西，(2) 在一个指定的栈上走 CloudFormation changeset，
 #                          (3) 把下面那个执行角色 PassRole 给 CloudFormation。
-#   CfnExecutionRole   ——  CloudFormation 执行 changeset 时代入的角色，真正建资源的是它，
+#   CicdExecutionRole  ——  CloudFormation 执行 changeset 时代入的角色，真正建资源的是它，
 #                          权限按资源名前缀收在这个应用自己的命名空间里。
 #
 # 这样 CI 凭据就算泄露，也只能"改这一个栈"，不能在账号里随手建东西。
 #
-# 仍然存在的张力（诚实写明，正在分步修复）：CfnExecutionRole 能写名字以应用栈名开头的任何 IAM 角色，
-# 包括它自己和 GitHubDeployRole，一份恶意模板可以借它提权。修复分三步：第 1 步建 AppRoleBoundary，并允许
-# 执行角色把它挂到三个应用角色上；第 2 步应用角色挂上边界；第 3 步新建改名后的 CI 角色（写应用角色必须带
-# 边界，显式禁止卸边界），切换过去后删除这两个旧角色。
+# 提权路径已关闭：执行角色只能写三个应用角色（EtlRole、ApiRole、定时器角色），而且写的时候角色必须带着
+# AppRoleBoundary；它不能卸边界、不能改边界策略，也碰不到两个 CI 角色。仍然存在的风险（诚实写明）：main 上的
+# 恶意模板仍可以建一个信任任意主体、但被边界封顶的应用角色；仍可以给函数加一个不带 SourceArn 的
+# API Gateway 调用授权；仍可以在本区域建别的 HTTP API。credit-default 的 HTTP API 若被替换，要带新 id 重部署本栈。
 #
 #   aws cloudformation deploy --stack-name quantai-cicd \
 #     --template-file aws/bootstrap/quantai-cicd.yaml --capabilities CAPABILITY_NAMED_IAM \
-#     --parameter-overrides ArtifactBucket=... DataBucket=... --region ca-central-1
+#     --parameter-overrides ArtifactBucket=... DataBucket=... CreditDefaultHttpApiId=... --region ca-central-1
 
 Parameters:
   GitHubRepo:
@@ -57,7 +58,7 @@ Parameters:
     Type: String
     AllowedPattern: '^[a-z0-9]{10}$'
     Description: >
-      Id of credit-default's HTTP API in this region; the new execution role is explicitly denied it.
+      Id of credit-default's HTTP API in this region; the execution role is explicitly denied it.
       Passed at deploy time, never committed.
 
 Resources:
@@ -101,238 +102,8 @@ Resources:
               - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-etl
               - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-etl:*
 
-  CfnExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub ${AppStackName}-cfn-exec
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: { Service: cloudformation.amazonaws.com }
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: manage-app-resources
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: LambdaFunctionsInAppNamespace
-                Effect: Allow
-                Action:
-                  - lambda:CreateFunction
-                  - lambda:DeleteFunction
-                  - lambda:GetFunction
-                  - lambda:GetFunctionConfiguration
-                  - lambda:UpdateFunctionCode
-                  - lambda:UpdateFunctionConfiguration
-                  - lambda:AddPermission
-                  - lambda:RemovePermission
-                  - lambda:GetPolicy
-                  - lambda:TagResource
-                  - lambda:UntagResource
-                  - lambda:ListTags
-                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*
-              - Sid: ReadImagesForLambda
-                # 用镜像建/更新函数时，调用方必须能读这个镜像
-                Effect: Allow
-                Action:
-                  - ecr:BatchGetImage
-                  - ecr:GetDownloadUrlForLayer
-                  - ecr:GetRepositoryPolicy
-                  # 不给 ecr:SetRepositoryPolicy：仓库策略由本栈声明（AllowLambdaSLR），Lambda 不需要改它；
-                  # 真要改时部署会直接失败，而不是悄悄改写一个 CloudFormation 管着的资源。
-                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepoPrefix}/*
-              - Sid: RolesInAppNamespace
-                Effect: Allow
-                Action:
-                  - iam:CreateRole
-                  - iam:DeleteRole
-                  - iam:GetRole
-                  - iam:UpdateRole
-                  - iam:UpdateAssumeRolePolicy
-                  - iam:PutRolePolicy
-                  - iam:GetRolePolicy
-                  - iam:DeleteRolePolicy
-                  - iam:AttachRolePolicy
-                  - iam:DetachRolePolicy
-                  - iam:ListRolePolicies
-                  - iam:ListAttachedRolePolicies
-                  - iam:TagRole
-                  - iam:UntagRole
-                  - iam:PassRole
-                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-*
-              - Sid: AttachBoundaryToAppRolesDuringRollout
-                # 分步上线期间的临时授权：只能把上面的边界挂到或卸下三个应用角色。卸边界只为第 2 步部署失败时
-                # CloudFormation 能回滚；第 3 步的新执行角色显式禁止卸边界，这条随旧角色一起删除（最晚本周内）。
-                Effect: Allow
-                Action:
-                  - iam:PutRolePermissionsBoundary
-                  - iam:DeleteRolePermissionsBoundary
-                Resource:
-                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-EtlRole-*
-                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-ApiRole-*
-                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-EtlFunctionNightlyRole-*
-                Condition:
-                  ArnEquals:
-                    iam:PermissionsBoundary: !Ref AppRoleBoundary
-              - Sid: HttpApi
-                Effect: Allow
-                Action:
-                  - apigateway:GET
-                  - apigateway:POST
-                  - apigateway:PUT
-                  - apigateway:PATCH
-                  - apigateway:DELETE
-                  - apigateway:TagResource
-                Resource:
-                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis
-                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/*
-                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*
-              - Sid: NightlySchedule
-                Effect: Allow
-                Action:
-                  - scheduler:CreateSchedule
-                  - scheduler:UpdateSchedule
-                  - scheduler:DeleteSchedule
-                  - scheduler:GetSchedule
-                Resource: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/*
-              - Sid: LogGroupsInAppNamespace
-                Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:DeleteLogGroup
-                  - logs:PutRetentionPolicy
-                  - logs:DeleteRetentionPolicy
-                  - logs:TagResource
-                  - logs:UntagResource
-                  - logs:ListTagsForResource
-                  - logs:GetDataProtectionPolicy
-                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppStackName}-*
-              - Sid: LogReadsWithoutResourceScope
-                # 栈有服务角色后，drift detection 也以这个角色跑 LogGroup 的 read handler。
-                # 这三个动作按 AWS Service Authorization Reference 只支持 Resource '*'，且都只读。
-                Effect: Allow
-                Action:
-                  - logs:DescribeLogGroups
-                  - logs:DescribeIndexPolicies
-                  - logs:DescribeResourcePolicies
-                Resource: '*'
-              - Sid: AlarmTopic
-                Effect: Allow
-                Action:
-                  - sns:CreateTopic
-                  - sns:DeleteTopic
-                  - sns:GetTopicAttributes
-                  - sns:SetTopicAttributes
-                  - sns:Subscribe
-                  - sns:Unsubscribe
-                  - sns:ListSubscriptionsByTopic
-                  - sns:GetSubscriptionAttributes
-                  - sns:TagResource
-                  - sns:UntagResource
-                Resource: !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${AppStackName}-*
-              - Sid: AlarmsInAppNamespace
-                Effect: Allow
-                Action:
-                  - cloudwatch:PutMetricAlarm
-                  - cloudwatch:DeleteAlarms
-                  - cloudwatch:TagResource
-                  - cloudwatch:UntagResource
-                  - cloudwatch:ListTagsForResource
-                Resource: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AppStackName}-*
-              - Sid: DescribeAlarmsIsAListCall
-                Effect: Allow
-                Action: cloudwatch:DescribeAlarms
-                Resource: '*'
-              - Sid: SamTransformRunsAsServiceRole
-                # 栈指定了服务角色后，CloudFormation 用这个角色的身份展开 SAM transform。
-                # CI #2 实测：缺这条时 changeset 直接 FAILED（exec 角色无权 CreateChangeSet on transform）。
-                Effect: Allow
-                Action: cloudformation:CreateChangeSet
-                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
-
-  GitHubDeployRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub ${AppStackName}-github-deploy
-      MaxSessionDuration: 3600
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Federated: !ImportValue github-oidc-provider-arn
-            Action: sts:AssumeRoleWithWebIdentity
-            Condition:
-              # StringEquals，不是 StringLike：不接受任何通配。
-              # 只有这一个仓库的这一个分支的 workflow 能换到凭据——PR、别的分支、
-              # fork、tag 签出来的 token，sub 都对不上。
-              StringEquals:
-                token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/heads/${Branch}
-      Policies:
-        - PolicyName: deploy-one-stack
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: ChangesetsOnAppStackOnly
-                Effect: Allow
-                Action:
-                  - cloudformation:CreateChangeSet
-                  - cloudformation:DescribeChangeSet
-                  - cloudformation:ExecuteChangeSet
-                  - cloudformation:DeleteChangeSet
-                  - cloudformation:DescribeStacks
-                  - cloudformation:DescribeStackEvents
-                  - cloudformation:DescribeStackResource
-                  - cloudformation:DescribeStackResources
-                  - cloudformation:GetTemplate
-                  - cloudformation:GetTemplateSummary
-                  - cloudformation:ListStackResources
-                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*
-              - Sid: SamTransform
-                Effect: Allow
-                Action: cloudformation:CreateChangeSet
-                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
-              - Sid: HandResourceCreationToCloudFormationOnly
-                Effect: Allow
-                Action: iam:PassRole
-                Resource: !GetAtt CfnExecutionRole.Arn
-                Condition:
-                  StringEquals:
-                    iam:PassedToService: cloudformation.amazonaws.com
-              - Sid: UploadPackagedTemplate
-                Effect: Allow
-                Action: [s3:PutObject, s3:GetObject]
-                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}/*
-              - Sid: ListArtifactBucket
-                Effect: Allow
-                Action: s3:ListBucket
-                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}
-              - Sid: EcrLoginIsAccountWide
-                Effect: Allow
-                Action: ecr:GetAuthorizationToken
-                Resource: '*'
-              - Sid: PushAppImagesOnly
-                Effect: Allow
-                Action:
-                  - ecr:BatchCheckLayerAvailability
-                  - ecr:BatchGetImage
-                  - ecr:CompleteLayerUpload
-                  - ecr:DescribeImages
-                  - ecr:DescribeRepositories
-                  - ecr:GetDownloadUrlForLayer
-                  - ecr:InitiateLayerUpload
-                  - ecr:PutImage
-                  - ecr:UploadLayerPart
-                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepoPrefix}/*
-              - Sid: SmokeTestReadsFunctionState
-                Effect: Allow
-                Action: lambda:GetFunctionConfiguration
-                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*
-
-  # 第 3a 步：改名并收紧后的两个 CI 角色，先和旧角色并存（expand）。CI 切到它们、验证通过后，
-  # 第 3b 步再删除旧角色。名字在 ${AppStackName}-* 之外：执行角色写不了自己，也写不了部署角色。
+  # CI 的两个角色。名字在 ${AppStackName}-* 之外，并且执行角色被显式禁止碰 quantai-cicd-* 和
+  # credit-default-cicd-*：模板改不了执行角色自己，也改不了部署角色和它的 OIDC 信任。
   CicdExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -658,10 +429,6 @@ Outputs:
     Value: !GetAtt EtlImageRepo.RepositoryUri
   ApiImageRepoUri:
     Value: !GetAtt ApiImageRepo.RepositoryUri
-  DeployRoleArn:
-    Value: !GetAtt GitHubDeployRole.Arn
-  CfnExecutionRoleArn:
-    Value: !GetAtt CfnExecutionRole.Arn
   AppRoleBoundaryArn:
     Value: !Ref AppRoleBoundary
   CicdDeployRoleArn:
