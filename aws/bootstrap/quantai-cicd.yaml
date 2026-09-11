@@ -136,7 +136,9 @@ Resources:
                   - lambda:ListTags
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*
               - Sid: InvokeGrantsForApiGatewayOnly
-                # 模板只能给函数加 API Gateway 调用授权，不能加公开或跨账号调用。
+                # 函数的调用授权只能写 API Gateway 服务主体。Lambda 没有 SourceArn、SourceAccount 的条件键，所以不带
+                # SourceArn（或带别的账号 SourceArn）的授权仍然可能，挡不住跨账号调用（见文件头的剩余风险）。
+                # RemovePermission 留在上面不加条件：删授权只会缩小权限，加条件反而可能卡住删栈、回滚和替换。
                 Effect: Allow
                 Action: lambda:AddPermission
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*
