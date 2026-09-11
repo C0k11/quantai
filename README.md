@@ -312,7 +312,7 @@ Runtime:
 flowchart TB
     EB["EventBridge Scheduler<br/>21:00 America/New_York, Mon-Fri"] --> ETL["Lambda: nightly ETL<br/>container image, --no-positions"]
     ETL -->|"position-free exports + warehouse file"| S3["S3 data lake<br/>exports/ config/ warehouse/"]
-    ETL --> CW["CloudWatch<br/>EMF metrics, 2 alarms"]
+    ETL --> CW["CloudWatch<br/>EMF metrics, 4 alarms"]
     CW --> SNS["SNS email"]
     GW["HTTP API<br/>5 rps, burst 10"] --> FN["Lambda: compute API<br/>/options/price, /signals"]
     FN -->|"read exports/"| S3
@@ -342,7 +342,7 @@ flowchart TB
 | Data lake | S3 | Versioned, all public access blocked, SSE-S3, TLS-only bucket policy |
 | Compute API | HTTP API + Lambda | `POST /options/price` (Black-Scholes + Greeks), `POST /signals`; 5 rps, burst 10 |
 | API secret | SSM Parameter Store (SecureString) | Only the parameter *name* is in the template |
-| Observability | CloudWatch + SNS | Embedded Metric Format metrics, 2 alarms, email |
+| Observability | CloudWatch + SNS | Embedded Metric Format metrics, 4 alarms, email |
 | App IaC | SAM (`aws/template.yaml`) | Lambdas, API, roles, logs, schedule, alarms |
 | CI bootstrap | CloudFormation (`aws/bootstrap/`) | GitHub OIDC provider, deploy role, CloudFormation execution role, app-role permissions boundary, ECR repositories |
 | Account IaC | Terraform (`infra/terraform/`) | Data-lake bucket and both budget alarms; remote state in S3 with native locking |
@@ -380,6 +380,13 @@ during benchmarking and the email was delivered. The failing
 source turned out to be a config entry that called Yahoo's per-symbol news feed
 without a symbol: it returned HTTP 400 on every run, including all 63 local runs
 since July, and nothing had ever flagged it. The entry is removed.
+
+**Two alarms catch a run that never started.** The error and feed alarms only see
+a function that ran. One more fires when EventBridge Scheduler fails to invoke the
+ETL, and another when the ETL has not been invoked for 4 days. Lambda publishes no
+`Invocations` datapoint when nothing runs, so missing data counts as breaching. Four
+days, not three: the Friday run lands at 01:00 UTC on Saturday and the next one at
+01:00 UTC on Tuesday, exactly 72 hours later.
 
 **Least privilege.** The ETL and API run under separate roles. S3 access is
 `GetObject`/`PutObject` on three prefixes of one bucket (the API role: read
@@ -476,8 +483,10 @@ matched by tag, so a run of failed deploys cannot delete what Lambda is running.
 repositories are retained if the stack is deleted or they are replaced; clearing
 images is always a separate manual step.
 
-Not validated end to end: the Lambda `Errors` alarm. It shares the SNS topic whose
-delivery was verified, but no real ETL failure has occurred to exercise the metric.
+Not validated end to end: the Lambda `Errors` alarm and the two did-not-run alarms.
+They share the SNS topic whose delivery was verified, but no real ETL failure or
+missed schedule has occurred to exercise them. The scheduler's path to the ETL was
+tested with a one-time schedule that used the same target and role.
 
 Prices were read from the AWS Pricing API on 2026-09-10, not taken from memory.
 
