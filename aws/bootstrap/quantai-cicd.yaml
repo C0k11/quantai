@@ -53,6 +53,12 @@ Parameters:
     Description: >
       Data lake bucket the app roles may use, the same value as the app stack's DataBucket parameter.
       Scopes the app role boundary. Passed at deploy time, never committed.
+  CreditDefaultHttpApiId:
+    Type: String
+    AllowedPattern: '^[a-z0-9]{10}$'
+    Description: >
+      Id of credit-default's HTTP API in this region; the new execution role is explicitly denied it.
+      Passed at deploy time, never committed.
 
 Resources:
 
@@ -325,6 +331,281 @@ Resources:
                 Action: lambda:GetFunctionConfiguration
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*
 
+  # 第 3a 步：改名并收紧后的两个 CI 角色，先和旧角色并存（expand）。CI 切到它们、验证通过后，
+  # 第 3b 步再删除旧角色。名字在 ${AppStackName}-* 之外：执行角色写不了自己，也写不了部署角色。
+  CicdExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: quantai-cicd-cfn-exec
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: manage-app-resources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: LambdaFunctionsInAppNamespace
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetFunctionRecursionConfig
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:RemovePermission
+                  - lambda:GetPolicy
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*
+              - Sid: InvokeGrantsForApiGatewayOnly
+                # 模板只能给函数加 API Gateway 调用授权，不能加公开或跨账号调用。
+                Effect: Allow
+                Action: lambda:AddPermission
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*
+                Condition:
+                  StringEquals:
+                    lambda:Principal: apigateway.amazonaws.com
+              - Sid: ReadImagesForLambda
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:GetRepositoryPolicy
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepoPrefix}/*
+              - Sid: AppRoleWritesOnlyWithBoundary
+                # 写应用角色（包括改信任、删角色）必须带着 AppRoleBoundary，任何应用角色都越不过边界。
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:PutRolePermissionsBoundary
+                Resource:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-EtlRole-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-ApiRole-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-EtlFunctionNightlyRole-*
+                Condition:
+                  ArnEquals:
+                    iam:PermissionsBoundary: !Ref AppRoleBoundary
+              - Sid: AppRoleReadsAndTags
+                # 读和打标签不带条件：GetRolePolicy、List 和 Tag 类动作没有 iam:PermissionsBoundary 条件键，
+                # 而 CloudFormation 建完角色和做 drift 检测都要读它。
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-EtlRole-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-ApiRole-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-EtlFunctionNightlyRole-*
+              - Sid: PassFunctionRolesToLambdaOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-EtlRole-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-ApiRole-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: lambda.amazonaws.com
+              - Sid: PassScheduleRoleToSchedulerOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-EtlFunctionNightlyRole-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: scheduler.amazonaws.com
+              - Sid: BoundaryStaysOn
+                Effect: Deny
+                Action: iam:DeleteRolePermissionsBoundary
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*
+              - Sid: BoundaryPolicyIsFixed
+                Effect: Deny
+                Action:
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicy
+                  - iam:DeletePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                Resource: !Ref AppRoleBoundary
+              - Sid: CiRolesAreOffLimits
+                Effect: Deny
+                Action: 'iam:*'
+                Resource:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/quantai-cicd-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/credit-default-cicd-*
+              - Sid: HttpApi
+                # HTTP API 的 id 在创建前未知，只能按区域授权；credit-default 的 API 在下一条按 id 显式禁止。
+                # 打标签走 /tags/* 上的 POST 和 DELETE（apigateway:TagResource 不是 IAM 动作）。
+                Effect: Allow
+                Action:
+                  - apigateway:GET
+                  - apigateway:POST
+                  - apigateway:PUT
+                  - apigateway:PATCH
+                  - apigateway:DELETE
+                Resource:
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/*
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*
+              - Sid: NeverTouchCreditDefaultHttpApi
+                Effect: Deny
+                Action: 'apigateway:*'
+                Resource:
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${CreditDefaultHttpApiId}
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${CreditDefaultHttpApiId}/*
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*${CreditDefaultHttpApiId}*
+              - Sid: NightlySchedule
+                Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:UpdateSchedule
+                  - scheduler:DeleteSchedule
+                  - scheduler:GetSchedule
+                Resource: !Sub arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/EtlFunctionNightly
+              - Sid: LogGroupsInAppNamespace
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
+                  - logs:GetDataProtectionPolicy
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppStackName}-*
+              - Sid: LogReadsWithoutResourceScope
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeIndexPolicies
+                  - logs:DescribeResourcePolicies
+                Resource: '*'
+              - Sid: AlarmTopic
+                Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                  - sns:SetTopicAttributes
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                  - sns:ListSubscriptionsByTopic
+                  - sns:GetSubscriptionAttributes
+                  - sns:TagResource
+                  - sns:UntagResource
+                  - sns:ListTagsForResource
+                  - sns:GetDataProtectionPolicy
+                Resource: !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${AppStackName}-*
+              - Sid: AlarmsInAppNamespace
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                  - cloudwatch:ListTagsForResource
+                Resource: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AppStackName}-*
+              - Sid: DescribeAlarmsIsAListCall
+                Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource: '*'
+              - Sid: SamTransformRunsAsServiceRole
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+
+  CicdDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: quantai-cicd-github-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !ImportValue github-oidc-provider-arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/heads/${Branch}
+      Policies:
+        - PolicyName: deploy-one-stack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ChangesetsOnAppStackOnly
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*
+              - Sid: SamTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+              - Sid: HandResourceCreationToCloudFormationOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CicdExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: UploadPackagedTemplate
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}/*
+              - Sid: ListArtifactBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}
+              - Sid: EcrLoginIsAccountWide
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: PushAppImagesOnly
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepoPrefix}/*
+              - Sid: SmokeTestReadsFunctionState
+                Effect: Allow
+                Action: lambda:GetFunctionConfiguration
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-*
+
   # 两个镜像仓库归这个引导栈管。此前是 sam deploy --resolve-image-repos 自动建的 companion 栈，
   # 没有生命周期策略，每次部署永久多约 0.74 GiB（含部署失败时已推上去的镜像）。
   # 仓库必须先于应用栈存在：sam deploy 在建 changeset 之前就推镜像，所以不能放进应用栈。
@@ -383,3 +664,7 @@ Outputs:
     Value: !GetAtt CfnExecutionRole.Arn
   AppRoleBoundaryArn:
     Value: !Ref AppRoleBoundary
+  CicdDeployRoleArn:
+    Value: !GetAtt CicdDeployRole.Arn
+  CicdExecutionRoleArn:
+    Value: !GetAtt CicdExecutionRole.Arn
