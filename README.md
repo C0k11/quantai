@@ -344,7 +344,7 @@ flowchart TB
 | API secret | SSM Parameter Store (SecureString) | Only the parameter *name* is in the template |
 | Observability | CloudWatch + SNS | Embedded Metric Format metrics, 2 alarms, email |
 | App IaC | SAM (`aws/template.yaml`) | Lambdas, API, roles, logs, schedule, alarms |
-| CI bootstrap | CloudFormation (`aws/bootstrap/`) | GitHub OIDC provider, deploy role, CloudFormation execution role, ECR repositories |
+| CI bootstrap | CloudFormation (`aws/bootstrap/`) | GitHub OIDC provider, deploy role, CloudFormation execution role, app-role permissions boundary, ECR repositories |
 | Account IaC | Terraform (`infra/terraform/`) | Data-lake bucket and both budget alarms; remote state in S3 with native locking |
 | CI/CD | GitHub Actions (`.github/workflows/deploy.yml`) | Tests gate the deploy; OIDC federation, no long-lived AWS keys |
 
@@ -397,12 +397,17 @@ role cannot create resources itself: it can push images, upload the packaged
 template, and run change sets on one stack, passing a separate CloudFormation
 execution role that does the actual creation. Account-identifying values live in
 repository secrets, which the public Actions log masks, and the deploy step
-redacts the API endpoint from the stack-output table SAM prints. Known gap: the
-execution role can create roles under the app prefix without a permissions
-boundary.
+redacts the API endpoint from the stack-output table SAM prints. The execution
+role can write only the three app roles (ETL, API, schedule), and only while each
+carries a fixed permissions boundary that caps it at the data-lake prefixes, the
+API key parameter, the app's log groups and invoking the ETL. It cannot remove the
+boundary, edit the boundary policy, or touch either CI role. Remaining exposure: a
+malicious template on `main` could still create a boundary-capped app role that
+trusts any principal, grant API Gateway invoke on a function without a source ARN,
+or add another HTTP API in the region.
 
 **One owner per resource.** SAM owns the application, a small CloudFormation
-bootstrap owns the OIDC provider, the CI roles and the image repositories, Terraform
+bootstrap owns the OIDC provider, the CI roles, the app-role boundary and the image repositories, Terraform
 owns the data-lake bucket and budgets. The bucket and budgets were created by hand first and brought under
 Terraform with `import` blocks; the first plan showed zero changes for the bucket.
 Importing the budgets also fixed their cost basis: they counted spend after credits,
