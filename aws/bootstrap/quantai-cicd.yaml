@@ -16,13 +16,14 @@ Description: >
 #
 # 这样 CI 凭据就算泄露，也只能"改这一个栈"，不能在账号里随手建东西。
 #
-# 仍然存在的张力（诚实写明）：CfnExecutionRole 能创建名字以应用栈名开头的 IAM 角色，
-# 且不限制挂什么策略——一份恶意模板可以借它提权。缓解是信任策略只放行 main 分支；
-# 更强的做法是给它加 permissions boundary，这里没做。
+# 仍然存在的张力（诚实写明，正在分步修复）：CfnExecutionRole 能写名字以应用栈名开头的任何 IAM 角色，
+# 包括它自己和 GitHubDeployRole，一份恶意模板可以借它提权。修复分三步：第 1 步建 AppRoleBoundary，并允许
+# 执行角色把它挂到三个应用角色上；第 2 步应用角色挂上边界；第 3 步新建改名后的 CI 角色（写应用角色必须带
+# 边界，显式禁止卸边界），切换过去后删除这两个旧角色。
 #
 #   aws cloudformation deploy --stack-name quantai-cicd \
 #     --template-file aws/bootstrap/quantai-cicd.yaml --capabilities CAPABILITY_NAMED_IAM \
-#     --parameter-overrides ArtifactBucket=... --region ca-central-1
+#     --parameter-overrides ArtifactBucket=... DataBucket=... --region ca-central-1
 
 Parameters:
   GitHubRepo:
@@ -46,8 +47,53 @@ Parameters:
     Type: String
     Default: quantaietl
     Description: Name prefix of the ECR repositories that hold this app's images.
+  DataBucket:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: >
+      Data lake bucket the app roles may use, the same value as the app stack's DataBucket parameter.
+      Scopes the app role boundary. Passed at deploy time, never committed.
 
 Resources:
+
+  # 应用角色的权限边界：三个应用角色（EtlRole、ApiRole、SAM 生成的定时器角色）今天实际用到的权限的并集，
+  # 按 QuantAI 自己的资源收窄。它本身不授予任何权限，只给角色封顶。
+  # ManagedPolicyName、Path 和 Description 都是 createOnly，永远不要改：替换要先删掉一个正被当作边界用的策略，IAM 会拒绝。
+  AppRoleBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: quantai-cicd-app-boundary
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DataLakePrefixes
+            Effect: Allow
+            Action: [s3:GetObject, s3:PutObject]
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/exports/*
+              - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/config/*
+              - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/warehouse/*
+          - Sid: ApiKeyParameter
+            Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/quantai/api-key
+          - Sid: DecryptViaSsm
+            Effect: Allow
+            Action: kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+          - Sid: AppLogStreams
+            Effect: Allow
+            Action: [logs:CreateLogStream, logs:PutLogEvents]
+            Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppStackName}-*:*
+          - Sid: InvokeNightlyEtl
+            Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-etl
+              - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppStackName}-etl:*
 
   CfnExecutionRole:
     Type: AWS::IAM::Role
@@ -109,6 +155,20 @@ Resources:
                   - iam:UntagRole
                   - iam:PassRole
                 Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-*
+              - Sid: AttachBoundaryToAppRolesDuringRollout
+                # 分步上线期间的临时授权：只能把上面的边界挂到或卸下三个应用角色。卸边界只为第 2 步部署失败时
+                # CloudFormation 能回滚；第 3 步的新执行角色显式禁止卸边界，这条随旧角色一起删除（最晚本周内）。
+                Effect: Allow
+                Action:
+                  - iam:PutRolePermissionsBoundary
+                  - iam:DeleteRolePermissionsBoundary
+                Resource:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-EtlRole-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-ApiRole-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppStackName}-EtlFunctionNightlyRole-*
+                Condition:
+                  ArnEquals:
+                    iam:PermissionsBoundary: !Ref AppRoleBoundary
               - Sid: HttpApi
                 Effect: Allow
                 Action:
@@ -321,3 +381,5 @@ Outputs:
     Value: !GetAtt GitHubDeployRole.Arn
   CfnExecutionRoleArn:
     Value: !GetAtt CfnExecutionRole.Arn
+  AppRoleBoundaryArn:
+    Value: !Ref AppRoleBoundary
