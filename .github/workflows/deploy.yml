@@ -144,6 +144,29 @@ jobs:
           echo "unauthenticated POST /options/price -> $code"
           [ "$code" = "401" ] || { echo "::error::expected 401, got $code"; exit 1; }
 
+      - name: Health check (the API key is readable)
+        # 401 分不清「鉴权正常」和「key 根本读不到」，两种情况都是 401。GET /health 不带 key，只有服务它的
+        # 执行环境读到了 key 才回 200 {"ready": true}。读失败后 60 秒内不再重试（从那次读开始算），所以这里重试约 80 秒。
+        # 失败会把 workflow 标红，但栈已经在新版本上（pin 照样跑）。地址先打码，每次只打状态码、curl 退出码和 ready，
+        # 不打响应体；响应文件每次先清空，免得一次传输失败读到上一次的内容。
+        run: |
+          set -uo pipefail
+          endpoint=$(aws cloudformation describe-stacks --stack-name quantai-etl \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" --output text)
+          echo "::add-mask::$endpoint"
+          api_id=${endpoint#https://}; api_id=${api_id%%.*}
+          if [ -n "$api_id" ]; then echo "::add-mask::$api_id"; fi
+          for attempt in 1 2 3 4 5 6 7 8 9; do
+            : > "$RUNNER_TEMP/health.json"
+            res=$(curl -s -o "$RUNNER_TEMP/health.json" -w '%{http_code} rc=%{exitcode}' --max-time 35 "$endpoint/health") || true
+            ready=$(jq -r '.ready // false' "$RUNNER_TEMP/health.json" 2>/dev/null) || ready=false
+            echo "health attempt $attempt: $res ready=${ready:-false}"
+            if [ "$ready" = "true" ]; then exit 0; fi
+            if [ "$attempt" -lt 9 ]; then sleep 10; fi
+          done
+          echo "::error::GET /health never answered ready=true (status and curl exit code of each attempt above)"
+          exit 1
+
       - name: Pin the image each function runs
         # ECR 生命周期规则 1 只护带 deployed 标签的镜像，这里把标签打在 Lambda 实际在跑的 digest 上。
         # always()：部署或冒烟失败时函数仍在跑旧镜像，标签也要留在它身上。

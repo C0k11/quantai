@@ -5,6 +5,9 @@
     POST /options/price   Black-Scholes 理论价 + Greeks（入参全部由调用方给）
     POST /signals         对某标的重算组合信号（数据源是 S3 里的公开行情）
 
+外加 GET /health（不带 key）：只回 {"ready": true/false}，即服务它的执行环境是否已经读到 API key
+（读成功就缓存；读失败后 60 秒内不再重试，从那次读开始算），不带任何报错细节；CI 每次部署后查它。
+
 鉴权：`x-api-key` 头，与 SSM Parameter Store 的 SecureString 比对。
 **参数没设值就一律拒绝**（fail closed，不是 fail open）；读失败不永久缓存，退避后重试。
 
@@ -13,7 +16,7 @@ init 阶段（冷启动）只做 import：scipy、pandas、信号模块在模块
 付，不落到第一个真实请求上，CI 也不需要持有 API key。
 网络读取（API key、行情表）不放在 init：init 有 10 s 上限，一个卡住的 S3/SSM 调用会让整个函数起不来，
 连 401 路径都会失败。它们留在请求路径上，受函数超时约束，客户端超时收短，失败按退避重试：
-key 读不到一律 401；行情表读不到 /signals 返回 503。
+key 读不到时，需要 key 的路由一律 401，GET /health 回 503 {"ready": false}；行情表读不到 /signals 返回 503。
 
 环境变量：
     QUANTAI_S3_BUCKET     数据湖桶名
@@ -163,10 +166,22 @@ def _signals(body: dict) -> dict:
 _ROUTES = {"POST /options/price": _options_price, "POST /signals": _signals}
 
 
+def _health() -> dict:
+    """GET /health，不带 key：服务它的执行环境是否已经读到 API key。只回 ready，不带任何报错细节（原因看函数日志）。
+
+    和不带 key 的 POST 走同一个 _load_api_key：读成功一次就缓存，读失败后 KEY_RETRY_SEC 之内（从那次读开始算）
+    不再打 SSM，所以它读 SSM 不会比 401 路径更频繁；不读行情表。init 不联网（见模块说明），所以不能像 credit-default
+    那样只报 init 阶段的状态，那样一个还没接过请求的新执行环境会被误报成读不到 key。
+    """
+    return _json(200, {"ready": True}) if _load_api_key() else _json(503, {"ready": False})
+
+
 def handler(event, context):  # noqa: ANN001 - Lambda 签名
+    route = event.get("routeKey", "")
+    if route == "GET /health":
+        return _health()
     if not _authorised(event):
         return _json(401, {"error": "unauthorized"})
-    route = event.get("routeKey", "")
     fn = _ROUTES.get(route)
     if fn is None:
         return _json(404, {"error": f"no route {route}"})

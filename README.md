@@ -3,7 +3,7 @@
 **A personal quant workbench in two surfaces: a real-time trading console with a
 local-LLM analyst (Streamlit - the product anyone can clone and run), backed by a
 reconciled offline BI artifact (Power BI over a DuckDB/dbt star schema).**
-US equities (NYSE calendar), typed and tested (757 tests), honest by design. The nightly ETL and a small
+US equities (NYSE calendar), typed and tested (778 tests), honest by design. The nightly ETL and a small
 compute API run on AWS Lambda, deployed by GitHub Actions over OIDC
 ([details](#cloud-deployment-aws)).
 
@@ -314,7 +314,7 @@ flowchart TB
     ETL -->|"position-free exports + warehouse file"| S3["S3 data lake<br/>exports/ config/ warehouse/"]
     ETL --> CW["CloudWatch<br/>EMF metrics, 4 alarms"]
     CW --> SNS["SNS email"]
-    GW["HTTP API<br/>5 rps, burst 10"] --> FN["Lambda: compute API<br/>/options/price, /signals"]
+    GW["HTTP API<br/>5 rps, burst 10 per route"] --> FN["Lambda: compute API<br/>/options/price, /signals, /health"]
     FN -->|"read exports/"| S3
     FN --> SSM["SSM SecureString<br/>API key"]
 ```
@@ -330,7 +330,8 @@ flowchart TB
     CFN --> APP["SAM stack: Lambdas, API, roles, logs, schedule, alarms"]
     APP --> WARM["warm-up: 3 concurrent unauthenticated calls (401),<br/>new image loaded before real traffic"]
     WARM --> SMOKE["smoke test: both functions Active,<br/>unauthenticated call returns 401"]
-    SMOKE --> PIN["tag the image each function runs<br/>as deployed, exempt from expiry"]
+    SMOKE --> HEALTH["health check: GET /health, no key,<br/>ready only once the API key is readable"]
+    HEALTH --> PIN["tag the image each function runs<br/>as deployed, exempt from expiry"]
 ```
 
 ### What runs where
@@ -340,7 +341,7 @@ flowchart TB
 | Nightly ETL | Lambda (container image) | Same `scripts/warehouse.py --full` as local, with `--no-positions` |
 | Schedule | EventBridge Scheduler | `cron(0 21 ? * MON-FRI *)` in `America/New_York`, so it tracks the close through DST |
 | Data lake | S3 | Versioned, all public access blocked, SSE-S3, TLS-only bucket policy |
-| Compute API | HTTP API + Lambda | `POST /options/price` (Black-Scholes + Greeks), `POST /signals`; 5 rps, burst 10 |
+| Compute API | HTTP API + Lambda | `POST /options/price` (Black-Scholes + Greeks), `POST /signals`, `GET /health` (no key, readiness only); 5 rps, burst 10 per route, about 15 rps across the three |
 | API secret | SSM Parameter Store (SecureString) | Only the parameter *name* is in the template |
 | Observability | CloudWatch + SNS | Embedded Metric Format metrics, 4 alarms, email |
 | App IaC | SAM (`aws/template.yaml`) | Lambdas, API, roles, logs, schedule, alarms |
@@ -471,7 +472,12 @@ first deploy with this step each took about 6.8 s: the new-image penalty, paid b
 right after that deploy, five forced cold starts took 1.6 to 2.2 s of Init and 49 to 65 ms in
 the handler. The cost shows in the table: every cold start now pays about 2 s of Init, the 401
 path included. Summing the medians, cold `/options/price` went from about 2.7 s to 2.0 s and
-cold `/signals` from about 1.5 s to 2.1 s.
+cold `/signals` from about 1.5 s to 2.1 s. A 401 cannot tell a working key check from a key that
+cannot be read, so after the warm-up CI also calls `GET /health`. It needs no key, answers
+`{"ready": true}` only when the environment serving it has read the key, returns no error
+details, and shares the cached, backed-off key read with the 401 path, so it reads SSM no more
+often than an unauthenticated POST does: once per execution environment, or at most once a
+minute while the read fails.
 
 **Image storage is bounded, and the running image cannot expire.** The repositories
 SAM created on the first deploy had no lifecycle rule and reached 12 images (4.52 GiB),

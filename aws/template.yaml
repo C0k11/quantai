@@ -293,6 +293,16 @@ Resources:
             ApiId: !Ref HttpApi
             Method: POST
             Path: /signals
+        Health:
+          # 不带 key。只回 {"ready": true/false}：服务它的执行环境是否已经读到 API key，不带任何报错细节。
+          # 和不带 key 的 POST 共用同一次缓存的 key 读取（成功就缓存；读失败后 60 秒内不再打 SSM），不读行情表；
+          # 和每条路由一样受 stage 的 DefaultRouteSettings 限流（每条路由各自 5 rps、突发 10，三条合计约 15 rps）。
+          # CI 每次部署后查它。
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /health
     Metadata:
       DockerContext: ..
       Dockerfile: aws/api/Dockerfile

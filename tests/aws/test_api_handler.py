@@ -201,3 +201,91 @@ def test_signals_503_while_prices_unavailable_then_recovers(load, monkeypatch):
 def test_signals_unknown_symbol_is_404(load):
     mod, _, _ = load()
     assert status(mod, event(key="k-123", route="POST /signals", body={"symbol": "NOPE"})) == 404
+
+
+# ---------------------------------------------------------------- GET /health
+def health_event(key=None):
+    headers = {} if key is None else {"x-api-key": key}
+    return {"version": "2.0", "routeKey": "GET /health", "rawPath": "/health", "headers": headers,
+            "requestContext": {"http": {"method": "GET"}}, "isBase64Encoded": False}
+
+
+def test_health_needs_no_key_and_reads_the_key_once(load):
+    mod, ssm, s3 = load()
+    for _ in range(3):
+        out = mod.handler(health_event(), None)
+        assert out["statusCode"] == 200 and json.loads(out["body"]) == {"ready": True}
+    assert ssm.calls == 1 and s3.calls == 0            # cached after one read; never the price table
+
+
+def test_health_is_503_without_details_then_recovers_after_backoff(load, monkeypatch):
+    mod, ssm, s3 = load(ssm_outcomes=(RuntimeError("AccessDenied"), "k-123"))
+    clock = [0.0]
+    monkeypatch.setattr(mod, "_now", lambda: clock[0])
+    out = mod.handler(health_event(), None)
+    assert out["statusCode"] == 503 and json.loads(out["body"]) == {"ready": False}
+    clock[0] += mod.KEY_RETRY_SEC - 1                  # inside the back-off: no SSM call
+    assert status(mod, health_event()) == 503
+    assert ssm.calls == 1
+    clock[0] += 2                                      # back-off expired
+    assert status(mod, health_event()) == 200
+    assert ssm.calls == 2 and s3.calls == 0
+
+
+def test_health_shares_the_key_cache_with_the_401_path(load):
+    mod, ssm, _ = load()
+    assert status(mod, event()) == 401                 # the CI warm-up loads the key
+    assert status(mod, health_event()) == 200
+    assert ssm.calls == 1
+
+
+def test_only_get_health_skips_auth(load):
+    mod, _, _ = load()
+    assert status(mod, health_event(key="wrong")) == 200            # the header is never checked
+    assert status(mod, event(route="POST /health")) == 401          # other methods still need the key
+    assert status(mod, event(key="k-123", route="POST /health")) == 404
+
+
+def test_health_honours_a_back_off_started_by_the_401_path(load, monkeypatch):
+    mod, ssm, _ = load(ssm_outcomes=(RuntimeError("AccessDenied"), "k-123"))
+    clock = [1000.0]
+    monkeypatch.setattr(mod, "_now", lambda: clock[0])
+    assert status(mod, event()) == 401                 # this failed read starts the back-off
+    clock[0] += mod.KEY_RETRY_SEC - 1
+    assert status(mod, health_event()) == 503          # no SSM call inside that back-off
+    assert ssm.calls == 1
+
+
+def test_401_path_honours_a_back_off_started_by_health(load, monkeypatch):
+    mod, ssm, _ = load(ssm_outcomes=(RuntimeError("AccessDenied"), "k-123"))
+    clock = [1000.0]
+    monkeypatch.setattr(mod, "_now", lambda: clock[0])
+    assert status(mod, health_event()) == 503          # this failed read starts the back-off
+    clock[0] += mod.KEY_RETRY_SEC - 1
+    assert status(mod, event(key="k-123")) == 401      # no SSM call inside that back-off
+    assert ssm.calls == 1
+
+
+def _template() -> dict:
+    """aws/template.yaml parsed; CloudFormation short tags become {tag: value}, e.g. !Ref X -> {"Ref": "X"}."""
+    import yaml
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    def tag(loader, suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return {suffix: loader.construct_scalar(node)}
+        if isinstance(node, yaml.SequenceNode):
+            return {suffix: loader.construct_sequence(node, deep=True)}
+        return {suffix: loader.construct_mapping(node, deep=True)}
+
+    Loader.add_multi_constructor("!", tag)
+    return yaml.load(TEMPLATE.read_text(encoding="utf-8"), Loader=Loader)
+
+
+def test_template_routes_get_health_to_the_api_function():
+    health = _template()["Resources"]["ApiFunction"]["Properties"]["Events"]["Health"]
+    assert health == {"Type": "HttpApi",
+                      "Properties": {"ApiId": {"Ref": "HttpApi"}, "Method": "GET", "Path": "/health"}}
+    assert f"{health['Properties']['Method']} {health['Properties']['Path']}" == health_event()["routeKey"]
