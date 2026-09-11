@@ -454,8 +454,9 @@ is not passed, so changing only the default left the live function at 1769 MB.
 
 Cold starts are forced by changing an environment variable between invokes. The
 benchmark restores the original configuration, and CloudFormation drift detection
-afterwards reports all 15 resources it can check in sync (the 16th, the SNS email
-subscription, is outside what drift detection covers).
+afterwards reports every resource it can check in sync: 15 at the time, 18 now that the
+two did-not-run alarms and the `/health` permission exist (the SNS email subscription is
+outside what drift detection covers).
 
 **The first calls after a deploy used to be slow; CI now takes that hit.** On a freshly deployed
 image the first five authenticated `/options/price` cold starts once took 7.2, 6.0, 2.1, 2.2 and
