@@ -60,6 +60,11 @@ ui = [
 warehouse = [
     "dbt-duckdb>=1.9.0",      # raw(parquet/ETL) -> staging -> marts 的 SQL 转换 + 断言测试
 ]
+# 同一个 dbt 项目的 Snowflake target（profiles.yml 里的 snowflake 输出）。单列成 extra：
+# dbt-snowflake 1.12 把 certifi 钉在 2025.4.26 以下，不该随 warehouse 一起装进 ETL 镜像。
+snowflake = [
+    "dbt-snowflake>=1.10.0",
+]
 dev = [
     "pytest>=7.4.0",
     "ruff>=0.4.0",

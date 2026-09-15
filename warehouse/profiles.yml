@@ -1,6 +1,10 @@
-# dbt connection profile (local DuckDB file; no secrets - safe to commit).
-# Override the db file path with env var QUANTAI_DB_PATH (tests/CI point it
-# at a temp file). Relative paths resolve against --project-dir (this folder).
+# dbt connection profile (no secrets - safe to commit).
+# local: DuckDB file. Override the db file path with env var QUANTAI_DB_PATH
+#   (tests/CI point it at a temp file). Relative paths resolve against
+#   --project-dir (this folder).
+# snowflake: key-pair login as a service user. The account identifier and the
+#   private key path come only from env vars (locally from the git-ignored
+#   .env.snowflake.local); the other names default to this project's objects.
 # Keep ASCII-only (see dbt_project.yml note).
 quantai:
   target: local
@@ -9,3 +13,15 @@ quantai:
       type: duckdb
       path: "{{ env_var('QUANTAI_DB_PATH', '../data/warehouse/quantai.duckdb') }}"
       threads: 8
+    snowflake:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER', 'QUANTAI_DBT_USER') }}"
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'QUANTAI_DBT') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'QUANTAI_WH') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'QUANTAI') }}"
+      schema: "{{ env_var('SNOWFLAKE_SCHEMA', 'MARTS') }}"
+      threads: 4
+      query_tag: quantai-dbt
+      client_session_keep_alive: false
