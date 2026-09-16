@@ -1,3 +1,8 @@
 # Copy to terraform.tfvars (gitignored) and fill in.
 data_bucket_name = "your-data-lake-bucket"
 alarm_email      = "you@example.com"
+
+# Leave these two out on the first apply (snowflake.tf uses a placeholder trust), then fill them from
+# DESC INTEGRATION QUANTAI_S3_RAW and apply again.
+# snowflake_iam_user_arn = "STORAGE_AWS_IAM_USER_ARN"
+# snowflake_external_id  = "STORAGE_AWS_EXTERNAL_ID"
