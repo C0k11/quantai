@@ -2,7 +2,8 @@
 data_bucket_name = "your-data-lake-bucket"
 alarm_email      = "you@example.com"
 
-# Leave these two out on the first apply (snowflake.tf uses a placeholder trust), then fill them from
-# DESC INTEGRATION QUANTAI_S3_RAW and apply again.
-# snowflake_iam_user_arn = "STORAGE_AWS_IAM_USER_ARN"
-# snowflake_external_id  = "STORAGE_AWS_EXTERNAL_ID"
+# First apply, before the Snowflake integration exists: keep both empty (snowflake.tf then uses a
+# placeholder trust). After DESC INTEGRATION QUANTAI_S3_RAW, fill both and apply again. There are no
+# defaults on purpose: a missing value fails the plan instead of silently reverting the trust.
+snowflake_iam_user_arn = ""
+snowflake_external_id  = ""
