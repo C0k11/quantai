@@ -61,7 +61,7 @@ Resources:
             Principal: { Service: lambda.amazonaws.com }
             Action: sts:AssumeRole
       Policies:
-        # 最小权限：只读写这一个桶的三个前缀，只写自己那个日志组。
+        # 最小权限：只读写这一个桶的三个前缀、只写 raw/，只写自己那个日志组。
         # 没有 s3:ListBucket、没有 s3:DeleteObject、没有通配桶、没有 logs:* on *。
         - PolicyName: etl-least-privilege
           PolicyDocument:
@@ -74,6 +74,11 @@ Resources:
                   - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/exports/*
                   - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/config/*
                   - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/warehouse/*
+              # raw/ 是给 Snowflake 的 Parquet 快照：ETL 只写不读，读它的是 Terraform 管的 Snowflake 角色。
+              - Sid: WriteRawExportsOnly
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${DataBucket}/raw/*
               - Sid: WriteOwnLogStreamOnly
                 Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]

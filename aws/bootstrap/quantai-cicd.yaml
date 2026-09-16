@@ -80,6 +80,11 @@ Resources:
               - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/exports/*
               - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/config/*
               - !Sub arn:${AWS::Partition}:s3:::${DataBucket}/warehouse/*
+          # raw/ 是 ETL 给 Snowflake 的 Parquet 落地区：应用角色只写不读，读它的是 Terraform 管的 Snowflake 角色。
+          - Sid: RawExportWriteOnly
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::${DataBucket}/raw/*
           - Sid: ApiKeyParameter
             Effect: Allow
             Action: ssm:GetParameter

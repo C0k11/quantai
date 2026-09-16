@@ -87,6 +87,56 @@ def audit(dest: Path) -> None:
     print("[audit] 边界体检通过：无头寸文件，无持有标志")
 
 
+# raw 层 Parquet 快照：云上 ETL 写到 s3://<bucket>/raw/，Snowflake 从这里装载后跑同一个 dbt 项目。
+# 显式白名单：新加的 raw 表不会自动上云（测试要求每张 raw 表都被明确归类）；头寸两张表永不在内。
+RAW_PREFIX = "raw"
+POSITION_TABLES = {"positions", "portfolio_cash"}
+RAW_EXPORT_TABLES = (
+    "prices",
+    "trading_days",
+    "trades",
+    "signals",
+    "backtest_runs",
+    "backtest_equity",
+    "news",
+    "news_scores",
+    "event_odds",
+)
+
+
+def export_raw(db_path: Path, dest: Path) -> list[Path]:
+    """白名单里的 raw 表 -> dest/<table>.parquet，返回写出的文件（空表也写，带表结构）。"""
+    import duckdb
+
+    leaked = sorted(POSITION_TABLES.intersection(RAW_EXPORT_TABLES))
+    if leaked:
+        raise SystemExit(f"ABORT: raw 导出白名单含头寸表 {leaked}")
+    dest.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        for table in RAW_EXPORT_TABLES:
+            out = dest / f"{table}.parquet"
+            path_sql = out.as_posix().replace("'", "''")
+            con.execute(f"COPY (SELECT * FROM raw.{table}) TO '{path_sql}' (FORMAT PARQUET)")
+            written.append(out)
+    finally:
+        con.close()
+    return written
+
+
+def audit_raw(dest: Path) -> None:
+    """上传前体检：raw 暂存目录里只能有白名单表的 Parquet，出现头寸表或白名单外的表就中止。"""
+    names = {p.stem for p in dest.glob("*.parquet")}
+    leaked = sorted(names & POSITION_TABLES)
+    if leaked:
+        raise SystemExit(f"ABORT: raw 暂存目录含头寸表 {leaked}")
+    unknown = sorted(names - set(RAW_EXPORT_TABLES))
+    if unknown:
+        raise SystemExit(f"ABORT: raw 暂存目录含白名单外的表 {unknown}")
+    print(f"[audit] raw 体检通过：{len(names)} 张白名单表，无头寸表")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dry-run", action="store_true", help="只暂存与体检，不上传")

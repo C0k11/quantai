@@ -1,4 +1,8 @@
-"""Lambda 入口：夜间仓库刷新（行情/新闻 -> DuckDB -> dbt -> CSV -> S3）。
+"""Lambda 入口：夜间仓库刷新（行情/新闻 -> DuckDB -> dbt -> CSV 与 raw Parquet -> S3）。
+
+raw Parquet：白名单里的 raw 表导到 `raw/`，Snowflake 从那里装载后跑同一个 dbt 项目；
+头寸两张表不在白名单里，上传前 `s3_publish.audit_raw()` 再拦一次。
+可选环境变量 QUANTAI_S3_RAW_PREFIX，默认 raw。
 
 与本地 `scripts/warehouse.py --full` 同一套代码，差别只有三点：
 
@@ -34,6 +38,7 @@ sys.path.insert(0, str(TASK_ROOT / "scripts"))
 TMP = Path("/tmp")
 DB_PATH = TMP / "quantai.duckdb"
 EXPORT_DIR = TMP / "exports"
+RAW_DIR = TMP / "raw"
 WATCHLIST = TMP / "watchlist.yaml"
 
 # 云侧自有的仓库文件。**不是**本地那个 data/warehouse/quantai.duckdb——本地库含
@@ -131,7 +136,7 @@ def _cleanup() -> None:
     """Lambda 会复用执行环境，/tmp 不清理会跨调用累积。"""
     for p in (DB_PATH, WATCHLIST):
         p.unlink(missing_ok=True)
-    for d in (EXPORT_DIR, TMP / "dbt_target", TMP / "dbt_logs"):
+    for d in (EXPORT_DIR, RAW_DIR, TMP / "dbt_target", TMP / "dbt_logs"):
         shutil.rmtree(d, ignore_errors=True)
 
 
@@ -169,10 +174,23 @@ def handler(event, context):  # noqa: ANN001 - Lambda 签名
     # 回传云侧仓库，下次运行接着累积（新闻靠去重增量，从零建库会丢历史）
     _s3.upload_file(str(DB_PATH), bucket, DB_KEY)
 
+    # raw 层 Parquet 快照给 Snowflake。放在仓库回传之后：导出出错时函数照样报错告警，但当天累积的仓库已经存好。
+    # 白名单导出（头寸表不在内），上传前体检，逐个文件再拦一次。
+    raw_prefix = os.environ.get("QUANTAI_S3_RAW_PREFIX", s3_publish.RAW_PREFIX)
+    s3_publish.export_raw(DB_PATH, RAW_DIR)
+    s3_publish.audit_raw(RAW_DIR)
+    raw_uploaded = 0
+    for f in sorted(RAW_DIR.glob("*.parquet")):
+        if f.stem in s3_publish.POSITION_TABLES:
+            raise RuntimeError(f"边界违规：{f.name} 不该出现在云侧 raw 导出里")
+        _s3.upload_file(str(f), bucket, f"{raw_prefix}/{f.name}")
+        raw_uploaded += 1
+
     total_sec = time.perf_counter() - t0
     db_mb = round(DB_PATH.stat().st_size / 1_048_576, 1)
     result = {
         "uploaded": uploaded,
+        "raw_uploaded": raw_uploaded,
         "warm_start": warm,
         "cold_start": cold,
         "db_mb": db_mb,
@@ -185,6 +203,7 @@ def handler(event, context):  # noqa: ANN001 - Lambda 签名
         "EtlDurationMs": (round(etl_sec * 1000), "Milliseconds"),
         "TotalDurationMs": (round(total_sec * 1000), "Milliseconds"),
         "ExportedFiles": (uploaded, "Count"),
+        "RawExportFiles": (raw_uploaded, "Count"),
         "NewsFeedFailures": (feeds.count, "Count"),
         "WarehouseMB": (db_mb, "Megabytes"),
         "ColdStart": (1 if cold else 0, "Count"),
