@@ -3,9 +3,10 @@
 **A personal quant workbench in two surfaces: a real-time trading console with a
 local-LLM analyst (Streamlit - the product anyone can clone and run), backed by a
 reconciled offline BI artifact (Power BI over a DuckDB/dbt star schema).**
-US equities (NYSE calendar), typed and tested (778 tests), honest by design. The nightly ETL and a small
+US equities (NYSE calendar), typed and tested (795 tests), honest by design. The nightly ETL and a small
 compute API run on AWS Lambda, deployed by GitHub Actions over OIDC
-([details](#cloud-deployment-aws)).
+([details](#cloud-deployment-aws)), and the same dbt project also builds on Snowflake from the S3 lake
+([details](#snowflake-same-dbt-project-second-engine)).
 
 | Frontend - live workstation (Streamlit) | Power BI - offline analysis artifact |
 |---|---|
@@ -14,7 +15,7 @@ compute API run on AWS Lambda, deployed by GitHub Actions over OIDC
 
 *Frontend screenshots use the bundled `portfolio.example.yaml` - no real holdings shown.*
 
--> [Quick start](#quick-start) - [Two surfaces, one warehouse](#two-surfaces-one-warehouse) - [Architecture](#architecture) - [Cloud deployment](#cloud-deployment-aws)
+-> [Quick start](#quick-start) - [Two surfaces, one warehouse](#two-surfaces-one-warehouse) - [Architecture](#architecture) - [Cloud deployment](#cloud-deployment-aws) - [Snowflake](#snowflake-same-dbt-project-second-engine)
 
 The codebase was rebuilt bottom-up into the typed, tested `quantai/` package;
 the pre-rebuild tree is kept out of the repository entirely.
@@ -281,6 +282,9 @@ flowchart TB
   positions) - all passing on real market data.
 - **Reconciliation**: pytest runs a real `dbt build` and asserts SQL and pandas
   compute identical numbers (PnL to 1e-6, returns/drawdown to 1e-12).
+- **Second engine**: the same dbt project, tests included, builds on Snowflake from the
+  cloud ETL's raw Parquet snapshot, and a column-by-column reconciliation finds the marts
+  identical on both engines ([Snowflake](#snowflake-same-dbt-project-second-engine)).
 - **Dashboard spec**: [powerbi/SPEC.md](powerbi/SPEC.md) defines the five-view
   semantics - star-schema joins, window rules, per-view fields and encodings.
 - **Power BI (BI as code)**: [powerbi/](powerbi/README.md) implements that
@@ -311,12 +315,13 @@ Runtime:
 ```mermaid
 flowchart TB
     EB["EventBridge Scheduler<br/>21:00 America/New_York, Mon-Fri"] --> ETL["Lambda: nightly ETL<br/>container image, --no-positions"]
-    ETL -->|"position-free exports + warehouse file"| S3["S3 data lake<br/>exports/ config/ warehouse/"]
+    ETL -->|"position-free exports, raw Parquet, warehouse file"| S3["S3 data lake<br/>exports/ config/ warehouse/ raw/"]
     ETL --> CW["CloudWatch<br/>EMF metrics, 4 alarms"]
     CW --> SNS["SNS email"]
     GW["HTTP API<br/>5 rps, burst 10 per route"] --> FN["Lambda: compute API<br/>/options/price, /signals, /health"]
     FN -->|"read exports/"| S3
     FN --> SSM["SSM SecureString<br/>API key"]
+    S3 -->|"raw/, read-only role"| SF["Snowflake<br/>same dbt project, loaded on demand"]
 ```
 
 Deployment:
@@ -346,7 +351,8 @@ flowchart TB
 | Observability | CloudWatch + SNS | Embedded Metric Format metrics, 4 alarms, email |
 | App IaC | SAM (`aws/template.yaml`) | Lambdas, API, roles, logs, schedule, alarms |
 | CI bootstrap | CloudFormation (`aws/bootstrap/`) | GitHub OIDC provider, deploy role, CloudFormation execution role, app-role permissions boundary, ECR repositories |
-| Account IaC | Terraform (`infra/terraform/`) | Data-lake bucket and both budget alarms; remote state in S3 with native locking |
+| Account IaC | Terraform (`infra/terraform/`) | Data-lake bucket, both budget alarms, and the read-only role Snowflake assumes for `raw/`; remote state in S3 with native locking |
+| Second warehouse | Snowflake (AWS `ca-central-1`) | Loads the `raw/` snapshot through a storage integration and runs the same dbt project; on demand, not scheduled |
 | CI/CD | GitHub Actions (`.github/workflows/deploy.yml`) | Tests gate the deploy; OIDC federation, no long-lived AWS keys |
 
 ### Design decisions
@@ -357,7 +363,10 @@ news and warehouse products. This is enforced in code, not by convention:
 the cloud ETL runs with `--no-positions` (no `raw.positions` is ever produced),
 the export step omits `fact_positions` entirely, `dim_symbol.is_currently_held`
 is forced to False in anything published, and `scripts/s3_publish.py` audits the
-staging directory and aborts on a leak. Nine tests pin this. The cloud warehouse
+staging directory and aborts on a leak. The raw Parquet snapshot for Snowflake is an
+allowlist of nine raw tables: the two position tables are never exported, the staged files
+are audited again before upload, and Snowflake only ever creates them empty. Fourteen tests
+pin this. The cloud warehouse
 file was downloaded and inspected after deployment: 0 rows in `raw.positions` and
 `fact_positions`. Power BI therefore keeps reading local exports.
 
@@ -390,8 +399,8 @@ days, not three: the Friday run lands at 01:00 UTC on Saturday and the next one 
 01:00 UTC on Tuesday, exactly 72 hours later.
 
 **Least privilege.** The ETL and API run under separate roles. S3 access is
-`GetObject`/`PutObject` on three prefixes of one bucket (the API role: read
-`exports/` only); no `ListBucket`, no `DeleteObject`, no wildcard bucket; logs only
+`GetObject`/`PutObject` on three prefixes of one bucket plus `PutObject` alone on
+`raw/` (the API role: read `exports/` only); no `ListBucket`, no `DeleteObject`, no wildcard bucket; logs only
 into each function's own log group. `kms:Decrypt` cannot be scoped to the AWS
 managed key by resource, so a `kms:ViaService` condition pins it to SSM.
 
@@ -426,7 +435,7 @@ is one more component that can block deploys.
 
 **One owner per resource.** SAM owns the application, a small CloudFormation
 bootstrap owns the OIDC provider, the CI roles, the app-role boundary and the image repositories, Terraform
-owns the data-lake bucket and budgets. The bucket and budgets were created by hand first and brought under
+owns the data-lake bucket, the budgets and the role Snowflake assumes. The bucket and budgets were created by hand first and brought under
 Terraform with `import` blocks; the first plan showed zero changes for the bucket.
 Importing the budgets also fixed their cost basis: they counted spend after credits,
 so until the $100 signup credit ran out the $1 alarm could not fire. The console could
@@ -506,6 +515,87 @@ missed schedule has occurred to exercise them. The scheduler's path to the ETL w
 tested with a one-time schedule that used the same target and role.
 
 Prices were read from the AWS Pricing API on 2026-09-10, not taken from memory.
+
+## Snowflake: same dbt project, second engine
+
+The warehouse also runs on Snowflake (AWS `ca-central-1`, Standard edition trial). It reads
+the S3 lake the cloud ETL writes, runs the same dbt models and tests, and a reconciliation
+checks that both engines produce the same marts. Loading is on demand, not scheduled.
+
+```mermaid
+flowchart TB
+    ETL["Lambda: nightly ETL"] -->|"allowlisted raw tables as Parquet"| RAWP["S3 raw/"]
+    RAWP -->|"storage integration, read-only IAM role"| LOAD["infra/snowflake/load_raw.py<br/>RAW schema, full refresh per table"]
+    LOAD --> DBT["same dbt project<br/>staging views, marts tables, 68 tests"]
+    DBT --> REC["infra/snowflake/reconcile.py<br/>marts vs the DuckDB file from the same ETL run"]
+```
+
+**Access.** Snowflake reaches S3 through a storage integration that assumes an IAM role
+Terraform owns (`infra/terraform/snowflake.tf`). The role can read `raw/` and list only that
+prefix; it cannot write or delete. Its trust names Snowflake's IAM user for this account and
+requires the external ID Snowflake issued. That took two steps: the role first trusted only
+this account with a placeholder ID, then the values from `DESC INTEGRATION` went into the
+git-ignored `terraform.tfvars` and a second apply narrowed the trust. The integration's allowed
+locations are `raw/` alone. dbt logs in as a key-pair service user whose role owns only the
+schemas it creates and can use one warehouse. The account identifier and key path come from
+environment variables; nothing account-specific is in the repository. The Snowflake objects and
+grants were applied by hand as ACCOUNTADMIN; `infra/snowflake/admin_setup.sql` records the
+statements, with placeholders for the account-specific values.
+
+**Two dialects, one project.** Six constructs differ between DuckDB and Snowflake. Five go
+through `adapter.dispatch` macros in `warehouse/macros/cross_db.sql`, so DuckDB keeps its
+original SQL: the calendar spine (`generate_series` vs `array_generate_range` with
+`flatten`), the year-month label, the ISO weekday, the UTC-to-New-York news date (`timezone`
+vs `convert_timezone`), and the ASOF join that values positions (Snowflake puts the time
+comparison in `MATCH_CONDITION`; unmatched rows are null-padded on both engines). The sixth, a
+named `WINDOW` clause Snowflake rejects, became inline `OVER` clauses that both engines run.
+Five of the Snowflake forms were compiled with `EXPLAIN` in a session with no usable
+warehouse, so checking them cost nothing. A search for DuckDB-only functions missed the
+timezone call; the first Snowflake build caught it (84 passed, 1 error, 4 skipped), and the
+second build passed.
+
+**Loading.** The raw table DDL is shared with DuckDB: `init_raw_tables` runs unchanged on a
+Snowflake cursor. Before loading, the loader lists `raw/` and refuses a snapshot with a missing
+file or with files written more than 10 minutes apart, which one ETL run (300-second timeout)
+cannot produce. All nine tables then reload in one transaction, so a failure keeps the previous
+snapshot instead of mixing two: delete, then `COPY INTO` from each exact file with
+`FORCE = TRUE`, because Snowflake would otherwise skip an unchanged snapshot as already loaded
+and leave the table empty. The Parquet file format reads logical types, so dates and timestamps
+load as dates and timestamps.
+
+**Cost guardrails.** One X-Small warehouse that suspends after 60 seconds. A resource monitor
+with a 20-credit monthly quota (notify at 80%, suspend at 100%) covers all four warehouses in
+the account. Resource monitors cap warehouse credits only; serverless features such as
+Snowpipe, container services and Cortex are outside them. The trial account had granted the
+`PUBLIC` role, which every role inherits, usage on two container compute pools, Cortex AI
+functions and agent automations; those grants were revoked, so the dbt role can use only its
+own warehouse.
+
+Measured on 2026-09-16, on the snapshot from one ETL run:
+
+| | Value |
+|---|---|
+| Raw snapshot | 9 Parquet files, 1.1 MB; the position tables are not among them |
+| Load into Snowflake | 9 tables, 36,014 rows, each table's count equal to the DuckDB file's; position tables created empty |
+| dbt build on Snowflake | 21 models and 68 tests: 89 passed, 0 warnings, 0 errors, 8.2 to 8.7 s |
+| dbt build on DuckDB | 89 passed in the Lambda run that wrote the snapshot, and again locally on that run's warehouse file |
+| Reconciliation | 10 marts tables, 36,277 rows, 88 columns identical, cell by cell (integers exactly, floats within a relative 1e-9); largest float difference 0 |
+| Reconciliation, negative controls | A copy with two cells changed (one close by a relative 1e-6, one headline) fails on exactly those two; a copy with the largest volume (1.8e11) raised by one share fails on that cell, which the column fingerprint alone does not catch |
+| Credits | 0.08 of the monthly 20, for two loads, three full builds and five reconciliation runs, negative controls included |
+
+Run it. Prerequisites: the objects in `infra/snowflake/admin_setup.sql`, the IAM role from
+`infra/terraform/snowflake.tf`, a key pair, and the bucket name in `QUANTAI_S3_BUCKET` or the
+git-ignored `.aws-bucket-name.local` (the loader stops without it). The scripts read the
+connection from the env file; dbt reads only the environment, so export the same variables
+first. `SNOWFLAKE_ACCOUNT` and `SNOWFLAKE_PRIVATE_KEY_PATH` are required; user, role, warehouse
+and database default to the names in `warehouse/profiles.yml`.
+
+```bash
+pip install -e ".[warehouse,snowflake]"
+python infra/snowflake/load_raw.py --env-file .env.snowflake.local
+dbt build --project-dir warehouse --profiles-dir warehouse --target snowflake
+python infra/snowflake/reconcile.py --duckdb <warehouse file from the same ETL run> --env-file .env.snowflake.local
+```
 
 ## Integrity notes (deliberate, tested)
 
