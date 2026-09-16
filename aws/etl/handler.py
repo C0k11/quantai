@@ -2,7 +2,7 @@
 
 raw Parquet：白名单里的 raw 表导到 `raw/`，Snowflake 从那里装载后跑同一个 dbt 项目；
 头寸两张表不在白名单里，上传前 `s3_publish.audit_raw()` 再拦一次。
-可选环境变量 QUANTAI_S3_RAW_PREFIX，默认 raw。
+前缀固定为 raw/：ETL 角色、权限边界和 Snowflake 角色都只认这个前缀。
 
 与本地 `scripts/warehouse.py --full` 同一套代码，差别只有三点：
 
@@ -176,14 +176,14 @@ def handler(event, context):  # noqa: ANN001 - Lambda 签名
 
     # raw 层 Parquet 快照给 Snowflake。放在仓库回传之后：导出出错时函数照样报错告警，但当天累积的仓库已经存好。
     # 白名单导出（头寸表不在内），上传前体检，逐个文件再拦一次。
-    raw_prefix = os.environ.get("QUANTAI_S3_RAW_PREFIX", s3_publish.RAW_PREFIX)
+    # 前缀固定为 raw/，不做成环境变量：ETL 角色、权限边界和 Snowflake 角色都只认这个前缀。
     s3_publish.export_raw(DB_PATH, RAW_DIR)
     s3_publish.audit_raw(RAW_DIR)
     raw_uploaded = 0
     for f in sorted(RAW_DIR.glob("*.parquet")):
         if f.stem in s3_publish.POSITION_TABLES:
             raise RuntimeError(f"边界违规：{f.name} 不该出现在云侧 raw 导出里")
-        _s3.upload_file(str(f), bucket, f"{raw_prefix}/{f.name}")
+        _s3.upload_file(str(f), bucket, f"{s3_publish.RAW_PREFIX}/{f.name}")
         raw_uploaded += 1
 
     total_sec = time.perf_counter() - t0
