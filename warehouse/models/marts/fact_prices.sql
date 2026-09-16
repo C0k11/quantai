@@ -8,7 +8,8 @@ select
     p.low,
     p.close,
     p.volume,
-    p.close / lag(p.close) over w - 1                            as daily_return,
+    -- 窗口全部内联写：Snowflake 不支持命名 WINDOW 子句，内联后 DuckDB 与 Snowflake 用同一份 SQL。
+    p.close / lag(p.close) over (partition by p.symbol order by p.date) - 1 as daily_return,
     -- 不足 252 根时窗口只是"上市以来高点"，冒充 52 周高点会误导 -> 诚实置 NULL。
     case
         when count(*) over (
@@ -21,4 +22,3 @@ select
         ) - 1
     end                                                          as pct_from_52w_high
 from {{ ref('stg_prices') }} p
-window w as (partition by p.symbol order by p.date)

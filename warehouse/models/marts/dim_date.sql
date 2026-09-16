@@ -14,8 +14,8 @@ with bounds as (
 ),
 
 spine as (
-    select cast(unnest(generate_series(lo, hi, interval '1 day')) as date) as date
-    from bounds
+    -- 日历日序列、year_month、day_of_week 三处 DuckDB 与 Snowflake 写法不同，见 macros/cross_db.sql。
+    {{ day_spine('bounds', 'lo', 'hi') }}
 )
 
 select
@@ -23,8 +23,8 @@ select
     extract(year from s.date)                          as year,
     extract(quarter from s.date)                       as quarter,
     extract(month from s.date)                         as month,
-    strftime(s.date, '%Y-%m')                          as year_month,
-    extract(isodow from s.date)                        as day_of_week,  -- 1=Mon..7=Sun
+    {{ year_month('s.date') }}                         as year_month,
+    {{ iso_day_of_week('s.date') }}                    as day_of_week,  -- 1=Mon..7=Sun
     t.date is not null                                 as is_trading_day,
     coalesce(t.is_early_close, false)                  as is_early_close
 from spine s

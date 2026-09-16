@@ -24,8 +24,8 @@ priced as (
         p.close  as last_close,
         p.date   as price_date
     from agg a
-    asof left join {{ ref('stg_prices') }} p
-        on a.symbol = p.symbol and p.date <= a.as_of
+    -- DuckDB 写 asof left join，Snowflake 写 asof join ... match_condition，见 macros/cross_db.sql。
+    {{ asof_left_join(ref('stg_prices'), 'p', 'a.symbol = p.symbol', 'a.as_of', 'p.date') }}
 )
 
 select
