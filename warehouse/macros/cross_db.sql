@@ -46,6 +46,19 @@
     dayofweekiso({{ col }})
 {%- endmacro %}
 
+{# UTC 墙钟时间戳（不带时区）换到某个时区的当地日期。两边都是：先当作 UTC，再换成当地时间，再取日期。 #}
+{% macro local_date_from_utc(col, tz) -%}
+    {{ return(adapter.dispatch('local_date_from_utc', 'quantai_warehouse')(col, tz)) }}
+{%- endmacro %}
+
+{% macro default__local_date_from_utc(col, tz) -%}
+    cast(timezone('{{ tz }}', timezone('UTC', {{ col }})) as date)
+{%- endmacro %}
+
+{% macro snowflake__local_date_from_utc(col, tz) -%}
+    cast(convert_timezone('UTC', '{{ tz }}', {{ col }}) as date)
+{%- endmacro %}
+
 {#
   ASOF 左连接：左表每行取右表里 right_time <= left_time 的最近一行，找不到就补 NULL。
   Snowflake 的 ASOF JOIN 没有匹配时本身就补 NULL（官方文档）；时间比较写在 MATCH_CONDITION，ON 只能写等值条件。

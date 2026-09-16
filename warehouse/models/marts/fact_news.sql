@@ -9,7 +9,8 @@ select
     n.summary,
     -- published 是 UTC 墙钟：按美东时区归日再取 date——直接 cast 会把美东晚间
     -- 8 点后的新闻全记到"第二天"，情绪时间线与交易日系统性错位（审查实锤）
-    cast(timezone('America/New_York', timezone('UTC', n.published)) as date) as date,
+    -- DuckDB 的 timezone() 在 Snowflake 上是 convert_timezone()，见 macros/cross_db.sql。
+    {{ local_date_from_utc('n.published', 'America/New_York') }} as date,
     n.published,
     n.source,
     s.sentiment,
