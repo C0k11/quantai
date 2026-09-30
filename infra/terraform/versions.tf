@@ -4,7 +4,9 @@
 #   aws/template.yaml (SAM)        Lambda、HTTP API、IAM 执行角色、日志组、EventBridge、告警
 #   aws/bootstrap/*.yaml (CFN)     GitHub OIDC provider、CI 部署角色、CFN 执行角色
 #   infra/terraform/ (这里)         数据湖桶（SAM 只按名字引用它，从不创建它）、两个 Budgets、
-#                                  Snowflake 读 raw/ 的 IAM 角色（snowflake.tf）
+#                                  Snowflake 读 raw/ 的 IAM 角色（snowflake.tf）、
+#                                  GitHub 同步到 Azure 时读云侧 DuckDB 的角色（azure_sync.tf）
+#   infra/azure/                   Azure 一侧的全部资源（另一个根模块，同一个 state 桶，不同 key）
 #
 # 这里管的资源最初是手工/CLI 建的，用下面 imports.tf 的 import 块收编进 state，
 # 不是重建——数据湖里的数据不动。
