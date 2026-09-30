@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+alarm_email = "you@example.com"
+
+# Your public IPv4 while running sql_setup.py or the reconciliation from this machine; empty otherwise
+# (Data Factory reaches the database through the Azure-services rule and needs nothing here).
+sql_client_ips = []
