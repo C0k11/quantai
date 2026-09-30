@@ -3,10 +3,11 @@
 **A personal quant workbench in two surfaces: a real-time trading console with a
 local-LLM analyst (Streamlit - the product anyone can clone and run), backed by a
 reconciled offline BI artifact (Power BI over a DuckDB/dbt star schema).**
-US equities (NYSE calendar), typed and tested (795 tests), honest by design. The nightly ETL and a small
+US equities (NYSE calendar), typed and tested (807 tests), honest by design. The nightly ETL and a small
 compute API run on AWS Lambda, deployed by GitHub Actions over OIDC
 ([details](#cloud-deployment-aws)), and the same dbt project also builds on Snowflake from the S3 lake
-([details](#snowflake-same-dbt-project-second-engine)).
+([details](#snowflake-same-dbt-project-second-engine)); a Data Factory pipeline loads the marts into
+Azure SQL every weekday night ([details](#azure-nightly-load-into-azure-sql)).
 
 | Frontend - live workstation (Streamlit) | Power BI - offline analysis artifact |
 |---|---|
@@ -15,7 +16,7 @@ compute API run on AWS Lambda, deployed by GitHub Actions over OIDC
 
 *Frontend screenshots use the bundled `portfolio.example.yaml` - no real holdings shown.*
 
--> [Quick start](#quick-start) - [Two surfaces, one warehouse](#two-surfaces-one-warehouse) - [Architecture](#architecture) - [Cloud deployment](#cloud-deployment-aws) - [Snowflake](#snowflake-same-dbt-project-second-engine)
+-> [Quick start](#quick-start) - [Two surfaces, one warehouse](#two-surfaces-one-warehouse) - [Architecture](#architecture) - [Cloud deployment](#cloud-deployment-aws) - [Snowflake](#snowflake-same-dbt-project-second-engine) - [Azure](#azure-nightly-load-into-azure-sql)
 
 The codebase was rebuilt bottom-up into the typed, tested `quantai/` package;
 the pre-rebuild tree is kept out of the repository entirely.
@@ -285,6 +286,9 @@ flowchart TB
 - **Second engine**: the same dbt project, tests included, builds on Snowflake from the
   cloud ETL's raw Parquet snapshot, and a column-by-column reconciliation finds the marts
   identical on both engines ([Snowflake](#snowflake-same-dbt-project-second-engine)).
+- **Azure SQL**: a Data Factory pipeline loads the marts into Azure SQL every weekday night, and a
+  reconciliation finds them identical to the cloud warehouse file, cell by cell
+  ([Azure](#azure-nightly-load-into-azure-sql)).
 - **Dashboard spec**: [powerbi/SPEC.md](powerbi/SPEC.md) defines the five-view
   semantics - star-schema joins, window rules, per-view fields and encodings.
 - **Power BI (BI as code)**: [powerbi/](powerbi/README.md) implements that
@@ -322,6 +326,8 @@ flowchart TB
     FN -->|"read exports/"| S3
     FN --> SSM["SSM SecureString<br/>API key"]
     S3 -->|"raw/, read-only role"| SF["Snowflake<br/>same dbt project, loaded on demand"]
+    S3 -->|"warehouse file, read-only role"| GHA["GitHub Actions azure-sync"]
+    GHA --> AZ["Azure: ADLS Gen2, Data Factory, Azure SQL"]
 ```
 
 Deployment:
@@ -351,8 +357,9 @@ flowchart TB
 | Observability | CloudWatch + SNS | Embedded Metric Format metrics, 4 alarms, email |
 | App IaC | SAM (`aws/template.yaml`) | Lambdas, API, roles, logs, schedule, alarms |
 | CI bootstrap | CloudFormation (`aws/bootstrap/`) | GitHub OIDC provider, deploy role, CloudFormation execution role, app-role permissions boundary, ECR repositories |
-| Account IaC | Terraform (`infra/terraform/`) | Data-lake bucket, both budget alarms, and the read-only role Snowflake assumes for `raw/`; remote state in S3 with native locking |
+| Account IaC | Terraform (`infra/terraform/`) | Data-lake bucket, both budget alarms, and the read-only roles Snowflake (`raw/`) and the Azure sync (the warehouse file) assume; remote state in S3 with native locking |
 | Second warehouse | Snowflake (AWS `ca-central-1`) | Loads the `raw/` snapshot through a storage integration and runs the same dbt project; on demand, not scheduled |
+| Azure load | ADLS Gen2, Data Factory, Azure SQL (`infra/azure/`, `.github/workflows/azure-sync.yml`) | Weekday nights; OIDC from GitHub on both clouds ([Azure](#azure-nightly-load-into-azure-sql)) |
 | CI/CD | GitHub Actions (`.github/workflows/deploy.yml`) | Tests gate the deploy; OIDC federation, no long-lived AWS keys |
 
 ### Design decisions
@@ -365,8 +372,9 @@ the export step omits `fact_positions` entirely, `dim_symbol.is_currently_held`
 is forced to False in anything published, and `scripts/s3_publish.py` audits the
 staging directory and aborts on a leak. The raw Parquet snapshot for Snowflake is an
 allowlist of nine raw tables: the two position tables are never exported, the staged files
-are audited again before upload, and Snowflake only ever creates them empty. Fourteen tests
-pin this. The cloud warehouse
+are audited again before upload, and Snowflake only ever creates them empty. The Azure export is an
+allowlist of nine marts tables and stops if any symbol in the warehouse file is marked as held.
+Twenty tests pin this. The cloud warehouse
 file was downloaded and inspected after deployment: 0 rows in `raw.positions` and
 `fact_positions`. Power BI therefore keeps reading local exports.
 
@@ -435,7 +443,8 @@ is one more component that can block deploys.
 
 **One owner per resource.** SAM owns the application, a small CloudFormation
 bootstrap owns the OIDC provider, the CI roles, the app-role boundary and the image repositories, Terraform
-owns the data-lake bucket, the budgets and the role Snowflake assumes. The bucket and budgets were created by hand first and brought under
+owns the data-lake bucket, the budgets, the roles Snowflake and the Azure sync assume, and, as a separate
+root module with its own state key, everything on Azure. The bucket and budgets were created by hand first and brought under
 Terraform with `import` blocks; the first plan showed zero changes for the bucket.
 Importing the budgets also fixed their cost basis: they counted spend after credits,
 so until the $100 signup credit ran out the $1 alarm could not fire. The console could
@@ -595,6 +604,89 @@ pip install -e ".[warehouse,snowflake]"
 python infra/snowflake/load_raw.py --env-file .env.snowflake.local
 dbt build --project-dir warehouse --profiles-dir warehouse --target snowflake
 python infra/snowflake/reconcile.py --duckdb <warehouse file from the same ETL run> --env-file .env.snowflake.local
+```
+
+## Azure: nightly load into Azure SQL
+
+The marts also load into Azure SQL (Canada Central, free-trial subscription) every weekday night,
+through Data Factory. The source is the warehouse file the cloud ETL writes to S3, so Azure holds the
+same position-free data as the lake, and a reconciliation checks the load against that file cell by
+cell. Everything on Azure is Terraform (`infra/azure/`, its own root module and state key), and
+neither cloud holds a long-lived key for the other.
+
+```mermaid
+flowchart TB
+    ETL["Lambda: nightly ETL<br/>21:00 America/New_York, Mon-Fri"] -->|"warehouse file"| S3["S3 warehouse/quantai.duckdb"]
+    S3 -->|"read-only IAM role via OIDC"| GHA["GitHub Actions azure-sync<br/>02:37 UTC, Tue-Sat"]
+    GHA -->|"9 allowlisted marts as Parquet, manifest last,<br/>managed identity via OIDC"| ADLS["ADLS Gen2<br/>landing/marts/snapshot"]
+    ADLS -->|"storage event on the manifest"| ADF["Data Factory load_marts<br/>copy each table into stage"]
+    ADF --> PUB["ops.publish_marts<br/>row counts vs manifest, one transaction"]
+    PUB --> SQL["Azure SQL Database<br/>free offer, marts schema"]
+    ADF -->|"failed pipeline or trigger run"| MON["Azure Monitor alert, email"]
+```
+
+**Identity, no keys.** The sync job assumes an AWS role that can read one object,
+`warehouse/quantai.duckdb`, and nothing else; it trusts the same immutable-ID GitHub subject as the
+deploy role (`infra/terraform/azure_sync.tf`). On Azure the job signs in as a user-assigned managed
+identity through a federated credential for that subject (`infra/azure/github_oidc.tf`), and the
+identity can write the landing container and nothing else. The storage account has shared-key access
+disabled, so there are no account keys or SAS tokens to leak. The SQL server accepts Microsoft Entra
+authentication only; there is no SQL password. Data Factory uses its system-assigned managed identity:
+read access to the landing container, and in the database a user with `SELECT` and `INSERT` on
+`stage` and `EXECUTE` on `ops`, nothing on `marts`. The subscription, tenant and resource names live
+in repository secrets and a git-ignored `terraform.tfvars`.
+
+**Loading.** `infra/azure/export_marts.py` writes nine marts tables from an explicit allowlist to
+Parquet, then a manifest with each table's row count. The manifest is uploaded last and the Data
+Factory trigger fires on it, so a load never starts on a half-written snapshot. The pipeline copies
+each table into `stage`, four at a time; `ops.publish_marts` then checks that the manifest lists
+exactly the allowlisted tables and that every stage table holds the manifest's row count, and replaces
+all of `marts` in one transaction. The procedures run as their owner, which is why Data Factory needs
+no `ALTER` or `DELETE` rights. The first two test loads failed, and both fixes are in the code: the
+manifest dataset needs explicit delimiters, and the copy activity reads Parquet `TIMESTAMP_MICROS` as
+a 64-bit integer (only `INT96` and `TIMESTAMP_MILLIS` map to a date-time), so the exporter writes
+timestamps as `INT96` through pyarrow, which keeps the microseconds.
+
+**Holdings.** `fact_positions` is outside the allowlist, and the exporter stops on a warehouse file in
+which any symbol is marked as currently held, so the local warehouse, which has real positions,
+cannot be exported by mistake. The output directory is audited again before upload.
+
+**Cost guardrails.** The database is the Azure SQL free offer (serverless, 100,000 vCore seconds and
+32 GB a month), set to pause rather than bill when the monthly allowance runs out. A CA$5 monthly
+subscription budget emails at 20% actual and at 100% forecast; Cost Management reports cost before
+credits, so it fires during the trial. Snapshots in landing expire after 30 days, and the job skips a
+snapshot that is already there, so a night without a new ETL run costs nothing.
+
+**Known trade-off.** The SQL firewall admits Azure services (the `0.0.0.0` rule), because Data
+Factory's Azure integration runtime connects from shared Azure address ranges; authentication is still
+Entra-only. A managed virtual network with a private endpoint would close that, at a monthly cost this
+project does not justify.
+
+Measured on 2026-09-30, on the snapshot from one ETL run, uploaded by hand before the workflow existed:
+
+| | Value |
+|---|---|
+| Snapshot | 9 Parquet files, 2.2 MB, 41,106 rows; `fact_positions` is not among them |
+| Load | 98.9 s from the trigger to published marts: 9 copies of 18.5 to 22.4 s at 4 data integration units each, publish 15.8 s |
+| Reconciliation | 9 marts tables, 41,106 rows, 77 columns identical, cell by cell (integers exactly, floats within a relative 1e-9); largest float difference 0 |
+| Reconciliation, negative control | A copy with three cells changed (a close by a relative 1e-6, a headline, the largest volume plus one share) fails on exactly those three |
+| Cost per load | 0.6 DIU-hours of copy, CA$0.21 at the Canada Central list price of CA$0.3465 per DIU-hour, plus 13 activity runs; weekday nights come to about CA$5 a month |
+| Failure alert | The two failed test loads moved the pipeline-failure alert rule to Unhealthy |
+
+Prices were read from the Azure retail prices API on 2026-09-29.
+
+Run it. Prerequisites: an Azure subscription, `az login` (a personal Microsoft account needs
+`--tenant`), the state bucket in `infra/terraform/backend.local.hcl`, and ODBC Driver 18 for SQL
+Server for the two scripts that connect to the database. The SQL firewall admits this machine only
+while its address is in `sql_client_ips`.
+
+```bash
+pip install -e ".[warehouse,azure]"
+terraform -chdir=infra/azure init -backend-config=../terraform/backend.local.hcl
+terraform -chdir=infra/azure apply
+python infra/azure/sql_setup.py --duckdb <cloud warehouse file>
+python infra/azure/export_marts.py --duckdb <cloud warehouse file> --out out/marts/<snapshot>
+python infra/azure/reconcile.py --duckdb <the same file>
 ```
 
 ## Integrity notes (deliberate, tested)
