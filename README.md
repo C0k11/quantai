@@ -662,7 +662,7 @@ Factory's Azure integration runtime connects from shared Azure address ranges; a
 Entra-only. A managed virtual network with a private endpoint would close that, at a monthly cost this
 project does not justify.
 
-Measured on 2026-09-30, on the snapshot from one ETL run, uploaded by hand before the workflow existed:
+Measured on 2026-09-30, on the snapshot from one ETL run, first uploaded by hand and then by the workflow:
 
 | | Value |
 |---|---|
@@ -672,6 +672,7 @@ Measured on 2026-09-30, on the snapshot from one ETL run, uploaded by hand befor
 | Reconciliation, negative control | A copy with three cells changed (a close by a relative 1e-6, a headline, the largest volume plus one share) fails on exactly those three |
 | Cost per load | 0.6 DIU-hours of copy, CA$0.21 at the Canada Central list price of CA$0.3465 per DIU-hour, plus 13 activity runs; weekday nights come to about CA$5 a month |
 | Failure alert | The two failed test loads moved the pipeline-failure alert rule to Unhealthy |
+| Workflow run | `azure-sync` dispatched by hand: both OIDC sign-ins, download, export and upload took 20 s; the load it triggered took 144.3 s and the reconciliation was again identical; 317 log lines, no account, bucket, subscription, tenant or resource name in them |
 
 Prices were read from the Azure retail prices API on 2026-09-29.
 
