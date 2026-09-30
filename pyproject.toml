@@ -65,6 +65,11 @@ warehouse = [
 snowflake = [
     "dbt-snowflake>=1.10.0",
 ]
+# Azure SQL 的两个本机脚本（infra/azure/sql_setup.py、reconcile.py）用 pyodbc 连库，驱动是 ODBC Driver 18。
+# 单列成 extra：ETL 镜像和 CI 都用不到它，GitHub 上的 azure-sync 只装 duckdb 和 pyarrow。
+azure = [
+    "pyodbc>=5.0",
+]
 dev = [
     "pytest>=7.4.0",
     "ruff>=0.4.0",
