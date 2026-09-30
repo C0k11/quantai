@@ -1,0 +1,98 @@
+name: azure-sync
+
+# 每个工作日夜里把云侧 DuckDB 的 marts 快照送进 Azure：S3 -> 导出 Parquet -> ADLS 的 landing，最后写清单。
+# 清单一落地，Data Factory 的存储事件触发器就把它装进 Azure SQL（infra/azure/data_factory.tf）；这里只负责放快照。
+# 两边都没有长期密钥：AWS 用 OIDC 代入只读 warehouse/quantai.duckdb 的角色（infra/terraform/azure_sync.tf），
+# Azure 用 OIDC 登录只能写 landing 容器的托管身份（infra/azure/github_oidc.tf）。
+# 仓库是 public，Actions 日志公开：账号、桶名、存储账户名、订阅和租户 ID 全放 repository secrets，值会被自动打码。
+
+on:
+  schedule:
+    # ETL 在纽约时间工作日 21:00 跑（aws/template.yaml），夏令时是 01:00Z，冬令时是 02:00Z，约 75 秒跑完。
+    # 02:37Z 两种情况都在它之后，也错开了 GitHub 调度最挤的整点。
+    - cron: '37 2 * * 2-6'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Upload again even if this snapshot is already in landing (starts another load)
+        type: boolean
+        default: false
+
+concurrency:
+  group: azure-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # 只有这个 job 能要 OIDC token。
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install the exporter's dependencies
+        # 和 ETL 镜像同一版本（aws/etl/requirements.lock.txt）：要读的正是 ETL 写出的 DuckDB 文件。
+        run: pip install duckdb==1.5.5 pyarrow==20.0.0
+
+      - name: Read-only AWS role via OIDC (no long-lived keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AZURE_SYNC_ROLE_ARN }}
+          role-session-name: gha-azure-sync-${{ github.run_id }}
+          aws-region: ca-central-1
+          mask-aws-account-id: true
+
+      - name: Download the cloud DuckDB
+        id: snap
+        env:
+          DATA_BUCKET: ${{ secrets.DATA_BUCKET }}
+        run: |
+          set -euo pipefail
+          modified=$(aws s3api head-object --bucket "$DATA_BUCKET" --key warehouse/quantai.duckdb --query LastModified --output text)
+          snapshot=$(date -u -d "$modified" +%Y%m%dT%H%M%SZ)
+          aws s3 cp "s3://$DATA_BUCKET/warehouse/quantai.duckdb" "$RUNNER_TEMP/quantai.duckdb" --only-show-errors
+          echo "snapshot=$snapshot" >> "$GITHUB_OUTPUT"
+          echo "cloud DuckDB last written $modified, snapshot $snapshot"
+
+      - name: Export marts to Parquet (whitelist only, no position tables)
+        run: python infra/azure/export_marts.py --duckdb "$RUNNER_TEMP/quantai.duckdb" --out "$RUNNER_TEMP/marts/${{ steps.snap.outputs.snapshot }}"
+
+      - name: Azure login via OIDC (no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upload to landing (manifest last, it starts the Data Factory load)
+        env:
+          ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          SNAP: ${{ steps.snap.outputs.snapshot }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          # ETL 没跑（假日、失败）时文件没变，快照名也不变：已经装过就不再花一次装载的钱，除非手动 force。
+          exists=$(az storage blob exists --auth-mode login --account-name "$ACCOUNT" --container-name landing \
+            --name "marts/$SNAP/_manifest.csv" --query exists --output tsv --only-show-errors)
+          if [ "$exists" = "true" ] && [ "$FORCE" != "true" ]; then
+            echo "snapshot $SNAP is already in landing; nothing to do"
+            exit 0
+          fi
+          src="$RUNNER_TEMP/marts/$SNAP"
+          az storage blob upload-batch --auth-mode login --account-name "$ACCOUNT" --destination landing \
+            --destination-path "marts/$SNAP" --source "$src" --pattern '*.parquet' --overwrite \
+            --only-show-errors --output none
+          az storage blob upload --auth-mode login --account-name "$ACCOUNT" --container-name landing \
+            --name "marts/$SNAP/_manifest.csv" --file "$src/_manifest.csv" --overwrite \
+            --only-show-errors --output none
+          echo "uploaded $(ls "$src"/*.parquet | wc -l) parquet files, then the manifest, for snapshot $SNAP"
