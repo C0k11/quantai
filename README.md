@@ -6,8 +6,9 @@ reconciled offline BI artifact (Power BI over a DuckDB/dbt star schema).**
 US equities (NYSE calendar), typed and tested (807 tests), honest by design. The nightly ETL and a small
 compute API run on AWS Lambda, deployed by GitHub Actions over OIDC
 ([details](#cloud-deployment-aws)), and the same dbt project also builds on Snowflake from the S3 lake
-([details](#snowflake-same-dbt-project-second-engine)); a Data Factory pipeline loads the marts into
-Azure SQL every weekday night ([details](#azure-nightly-load-into-azure-sql)).
+([details](#snowflake-same-dbt-project-second-engine)); a Data Factory pipeline loaded the marts into
+Azure SQL every weekday night through October 2026, until the trial subscription ended
+([details](#azure-nightly-load-into-azure-sql)).
 
 | Frontend - live workstation (Streamlit) | Power BI - offline analysis artifact |
 |---|---|
@@ -286,8 +287,8 @@ flowchart TB
 - **Second engine**: the same dbt project, tests included, builds on Snowflake from the
   cloud ETL's raw Parquet snapshot, and a column-by-column reconciliation finds the marts
   identical on both engines ([Snowflake](#snowflake-same-dbt-project-second-engine)).
-- **Azure SQL**: a Data Factory pipeline loads the marts into Azure SQL every weekday night, and a
-  reconciliation finds them identical to the cloud warehouse file, cell by cell
+- **Azure SQL**: a Data Factory pipeline loaded the marts into Azure SQL every weekday night through
+  October 2026, and a reconciliation found them identical to the cloud warehouse file, cell by cell
   ([Azure](#azure-nightly-load-into-azure-sql)).
 - **Dashboard spec**: [powerbi/SPEC.md](powerbi/SPEC.md) defines the five-view
   semantics - star-schema joins, window rules, per-view fields and encodings.
@@ -326,7 +327,7 @@ flowchart TB
     FN -->|"read exports/"| S3
     FN --> SSM["SSM SecureString<br/>API key"]
     S3 -->|"raw/, read-only role"| SF["Snowflake<br/>same dbt project, loaded on demand"]
-    S3 -->|"warehouse file, read-only role"| GHA["GitHub Actions azure-sync"]
+    S3 -->|"warehouse file, read-only role"| GHA["GitHub Actions azure-sync<br/>October 2026, stopped with the trial"]
     GHA --> AZ["Azure: ADLS Gen2, Data Factory, Azure SQL"]
 ```
 
@@ -359,7 +360,7 @@ flowchart TB
 | CI bootstrap | CloudFormation (`aws/bootstrap/`) | GitHub OIDC provider, deploy role, CloudFormation execution role, app-role permissions boundary, ECR repositories |
 | Account IaC | Terraform (`infra/terraform/`) | Data-lake bucket, both budget alarms, and the read-only roles Snowflake (`raw/`) and the Azure sync (the warehouse file) assume; remote state in S3 with native locking |
 | Second warehouse | Snowflake (AWS `ca-central-1`) | Loads the `raw/` snapshot through a storage integration and runs the same dbt project; on demand, not scheduled |
-| Azure load | ADLS Gen2, Data Factory, Azure SQL (`infra/azure/`, `.github/workflows/azure-sync.yml`) | Weekday nights; OIDC from GitHub on both clouds ([Azure](#azure-nightly-load-into-azure-sql)) |
+| Azure load | ADLS Gen2, Data Factory, Azure SQL (`infra/azure/`, `.github/workflows/azure-sync.yml`) | Weekday nights in October 2026, disabled since the trial subscription ended on Oct 31; OIDC from GitHub on both clouds ([Azure](#azure-nightly-load-into-azure-sql)) |
 | CI/CD | GitHub Actions (`.github/workflows/deploy.yml`) | Tests gate the deploy; OIDC federation, no long-lived AWS keys |
 
 ### Design decisions
@@ -608,11 +609,19 @@ python infra/snowflake/reconcile.py --duckdb <warehouse file from the same ETL r
 
 ## Azure: nightly load into Azure SQL
 
-The marts also load into Azure SQL (Canada Central, free-trial subscription) every weekday night,
-through Data Factory. The source is the warehouse file the cloud ETL writes to S3, so Azure holds the
-same position-free data as the lake, and a reconciliation checks the load against that file cell by
-cell. Everything on Azure is Terraform (`infra/azure/`, its own root module and state key), and
-neither cloud holds a long-lived key for the other.
+Through October 2026 a Data Factory pipeline also loaded the marts into Azure SQL (Canada Central,
+free-trial subscription) every weekday night. The source was the warehouse file the cloud ETL writes
+to S3, so Azure held the same position-free data as the lake, and a reconciliation checks the load
+against that file cell by cell. Everything on Azure is Terraform (`infra/azure/`, its own root module
+and state key), and neither cloud holds a long-lived key for the other.
+
+**Status.** The workflow ran on all 22 weekday nights from Oct 1 to Oct 30 and every upload
+succeeded; GitHub started the 02:37 UTC schedule 6 to 7 hours late each night, which only moved the
+load later. The trial subscription ended on Oct 31 and Azure disabled it, so from that night the upload
+failed with `AccountIsDisabled`, and the workflow is now disabled. Data Factory's results for the
+October nights were not read back before the subscription was disabled. The subscription was not
+upgraded to pay-as-you-go, so Azure deletes the resources after Dec 5; `infra/azure/` and the scripts
+below rebuild them.
 
 ```mermaid
 flowchart TB
@@ -622,7 +631,7 @@ flowchart TB
     ADLS -->|"storage event on the manifest"| ADF["Data Factory load_marts<br/>copy each table into stage"]
     ADF --> PUB["ops.publish_marts<br/>row counts vs manifest, one transaction"]
     PUB --> SQL["Azure SQL Database<br/>free offer, marts schema"]
-    ADF -->|"failed pipeline or trigger run"| MON["Azure Monitor alert, email"]
+    ADF -->|"failed pipeline or trigger run"| MON["Azure Monitor alert rules"]
 ```
 
 **Identity, no keys.** The sync job assumes an AWS role that can read one object,
@@ -654,7 +663,7 @@ cannot be exported by mistake. The output directory is audited again before uplo
 **Cost guardrails.** The database is the Azure SQL free offer (serverless, 100,000 vCore seconds and
 32 GB a month), set to pause rather than bill when the monthly allowance runs out. A CA$5 monthly
 subscription budget emails at 20% actual and at 100% forecast; Cost Management reports cost before
-credits, so it fires during the trial. Snapshots in landing expire after 30 days, and the job skips a
+credits, so it fired during the trial: both mails arrived on Oct 6. Snapshots in landing expire after 30 days, and the job skips a
 snapshot that is already there, so a night without a new ETL run costs nothing.
 
 **Known trade-off.** The SQL firewall admits Azure services (the `0.0.0.0` rule), because Data
@@ -671,7 +680,7 @@ Measured on 2026-09-30, on the snapshot from one ETL run, first uploaded by hand
 | Reconciliation | 9 marts tables, 41,106 rows, 77 columns identical, cell by cell (integers exactly, floats within a relative 1e-9); largest float difference 0 |
 | Reconciliation, negative control | A copy with three cells changed (a close by a relative 1e-6, a headline, the largest volume plus one share) fails on exactly those three |
 | Cost per load | 0.6 DIU-hours of copy, CA$0.21 at the Canada Central list price of CA$0.3465 per DIU-hour, plus 13 activity runs; weekday nights come to about CA$5 a month |
-| Failure alert | The two failed test loads moved the pipeline-failure alert rule to Unhealthy |
+| Failure alert | The two failed test loads moved the pipeline-failure alert rule to Unhealthy, but no email arrived: Azure asks an action group's address to confirm a verification mail before it sends alerts there, and that step was never done |
 | Workflow run | `azure-sync` dispatched by hand: both OIDC sign-ins, download, export and upload took 20 s; the load it triggered took 144.3 s and the reconciliation was again identical; 317 log lines, no account, bucket, subscription, tenant or resource name in them |
 
 Prices were read from the Azure retail prices API on 2026-09-29.
